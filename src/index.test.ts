@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { buildMentionMessages } from "./ai-prompts.js";
 import { parseModelOptionsFromModelsResponse, parseOpenAiChatResponseText, parseOpenAiEmbeddingsResponse } from "./ai-provider.js";
-import { regexIntentRoute, shouldClarifySearchScope, shouldSearchMemory, shouldUseRecentContext, shouldUseSpoilerWarning, shouldUseWebSearch } from "./ai-routing.js";
+import { regexIntentRoute, shouldSearchMemory, shouldUseRecentContext, shouldUseSpoilerWarning } from "./ai-routing.js";
 import { parseIds, resolveAiEnabledSetting, resolveAiProviderConfig, resolveRuntimeSettings } from "./config.js";
 import { controlPanelTimerKey, handleInteraction } from "./control-panel-interactions.js";
 import { ADMIN_NAV_MODULES, SETTINGS_NAV_MODULES, adminModuleFromValue, aiSettingsPanelMessage, settingsModuleFromValue } from "./control-panels.js";
@@ -17,7 +17,6 @@ import { steamFreeItemsMissingFromChannel } from "./steam-free-runtime.js";
 import { Store } from "./store.js";
 import { discordTimestamp, safeMentions, splitDiscordText, stripBotMention } from "./text.js";
 import { normalizeVoiceNameTemplate, renderVoiceChannelName, resolveVoiceSettings, voiceStatusLabel } from "./voice.js";
-import { parseSearxngSearchResponse } from "./web-search.js";
 
 function messageText(message: { content: unknown }): string {
   if (typeof message.content === "string") return message.content;
@@ -399,8 +398,8 @@ test("safeMentions prevents generated content from pinging everyone or ids", () 
 
 test("deterministic intent router chooses data sources", () => {
   assert.equal(regexIntentRoute("剛剛在討論什麼？").intent, "recent_context");
-  assert.equal(regexIntentRoute("今天台北天氣如何？").intent, "web_search");
-  assert.equal(regexIntentRoute("幫我找 Discord bot").intent, "ambiguous");
+  assert.equal(regexIntentRoute("今天台北天氣如何？").intent, "answer_only");
+  assert.equal(regexIntentRoute("幫我找 Discord bot").intent, "answer_only");
   assert.equal(regexIntentRoute("主角最後死了嗎？").useSpoiler, true);
 });
 
@@ -876,55 +875,7 @@ test("semantic memory search ranks embeddings only in the exact current channel"
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("web search trigger avoids conversation-memory prompts", () => {
-  assert.equal(shouldUseWebSearch("幫我查 Gemini 最新 rate limit"), true);
-  assert.equal(shouldUseWebSearch("最近模型有哪些？"), true);
-  assert.equal(shouldUseWebSearch("今天台北天氣如何？"), true);
-  assert.equal(shouldUseWebSearch("幫我找 Discord bot"), false);
-  assert.equal(shouldUseWebSearch("查網路 Discord bot"), true);
-  assert.equal(shouldUseWebSearch("剛剛在討論什麼？"), false);
-  assert.equal(shouldUseWebSearch("搜尋對話裡 alpha project"), false);
-  assert.equal(shouldUseWebSearch("幫我找昨天那則訊息"), false);
-  assert.equal(shouldClarifySearchScope("幫我找 Discord bot"), true);
-  assert.equal(shouldClarifySearchScope("查網路 Discord bot"), false);
-  assert.equal(shouldClarifySearchScope("查聊天紀錄 Discord bot"), false);
-});
-
-test("SearXNG results are parsed and added as untrusted web context", () => {
-  const webSearch = parseSearxngSearchResponse({
-    results: [
-      { title: "Example A", url: "https://example.com/a", content: " first result " },
-      { title: "Duplicate", url: "https://example.com/a", content: "duplicate" },
-      { title: "", url: "https://example.com/b", content: "second\nresult" },
-      { title: "Bad", content: "missing url" }
-    ]
-  }, "alpha");
-
-  assert.deepEqual(webSearch.results.map((item) => item.url), ["https://example.com/a", "https://example.com/b"]);
-  assert.equal(webSearch.results[1].content, "second result");
-
-  const messages = buildMentionMessages({
-    question: "幫我查 alpha 最新消息",
-    askingMessage: {
-      id: "ask",
-      authorId: "user",
-      authorName: "HoRo",
-      content: "幫我查 alpha 最新消息",
-      createdAt: "2026-06-18T00:00:00.000Z",
-      url: "https://discord.com/channels/guild/channel/ask"
-    },
-    webSearch
-  });
-
-  assert.match(messageText(messages[1]), /網路搜尋結果/);
-  assert.match(messageText(messages[1]), /\[1\] Example A/);
-  assert.match(messageText(messages[1]), /<untrusted_web_content>\nfirst result/);
-  assert.match(messageText(messages[1]), /引用來源時使用來源編號或 URL/);
-});
-
-test("backfill job tracks targets, retries, and status", () => {
+});test("backfill job tracks targets, retries, and status", () => {
   const dir = mkdtempSync(join(tmpdir(), "horo-discord-bot-"));
   try {
     const store = new Store(join(dir, "bot.sqlite"));

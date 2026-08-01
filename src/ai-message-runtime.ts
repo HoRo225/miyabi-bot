@@ -15,11 +15,6 @@ import {
   type IntentRoute
 } from "./ai-routing.js";
 import type { Config } from "./config.js";
-import {
-  agentToolsEnabled,
-  replyWithAgentApproval,
-  runDiscordAgent
-} from "./discord-agent-runtime.js";
 import { aiAccessForMessage } from "./discord-message-runtime.js";
 import {
   boundedContextMessages,
@@ -32,7 +27,6 @@ import { attachmentLimitError, resolvePromptMessageRef } from "./prompt-message-
 import { runtimeSettingsFromStore } from "./runtime-settings.js";
 import { Store } from "./store.js";
 import { safeMentions, splitDiscordText, stripBotMention } from "./text.js";
-import { webSearchForQuestion } from "./web-search.js";
 
 type SendableChannel = {
   send(options: unknown): Promise<unknown>;
@@ -267,37 +261,17 @@ export async function handleAiMention(message: Message, client: Client, store: S
     const askingMessage = await resolvePromptMessageRef(message, store, runtime.attachmentMaxBytes);
     targetMessage = referencedMessage ? await resolvePromptMessageRef(referencedMessage, store, runtime.attachmentMaxBytes) : undefined;
     const route = regexIntentRoute(question, askingMessage, targetMessage);
-    if (route.intent === "ambiguous") {
-      await message.reply({
-        content: safeMentions(route.clarifyingQuestion ?? "你是要查網路，還是查 Discord 聊天紀錄？"),
-        allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser }
-      });
-      return;
-    }
     const memory = await memoryForQuestion(store, config, question, message.channelId, runtime.summaryMessageLimit, [message.id], route);
-    const webSearch = await webSearchForQuestion(config, question, route);
     const promptMessages = buildMentionMessages({
       question,
       askingMessage,
       targetMessage,
       memory,
-      webSearch,
       useSpoilerWarning: route.useSpoiler
     });
-    if (agentToolsEnabled(store)) {
-      const agentResult = await runDiscordAgent(message, store, config, question, promptMessages);
-      providerResult = agentResult;
-      if (agentResult.kind === "approval") {
-        successfulStatus = "pending_approval";
-        await replyWithAgentApproval(message, agentResult.action, agentResult.summary);
-      } else {
-        await replyDiscordChunks(message, agentResult.content, runtime.replyMentionUser);
-      }
-    } else {
-      const chatResult = await callAiProvider(store, config, promptMessages);
-      providerResult = chatResult;
-      await replyDiscordChunks(message, chatResult.content, runtime.replyMentionUser);
-    }
+    const chatResult = await callAiProvider(store, config, promptMessages);
+    providerResult = chatResult;
+    await replyDiscordChunks(message, chatResult.content, runtime.replyMentionUser);
     store.logAiRequest({
       actorId: message.author.id,
       channelId: message.channelId,

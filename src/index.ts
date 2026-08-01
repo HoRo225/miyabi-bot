@@ -19,7 +19,6 @@ import {
 import { runBackfillJob } from "./backfill-runtime.js";
 import { loadConfig, type Config } from "./config.js";
 import { handleInteraction } from "./control-panel-interactions.js";
-import { handleAgentInteraction } from "./discord-agent-runtime.js";
 import {
   forgetDiscordMessage,
   rememberDiscordMessage,
@@ -98,8 +97,6 @@ async function main(): Promise<void> {
   let acceptingEvents = true;
   let stopHealth: () => void = () => undefined;
   let stopEmbeddings: () => Promise<void> = async () => undefined;
-  const pendingActionPruneTimer = setInterval(() => store.pruneAgentPendingActions(), 60_000);
-  pendingActionPruneTimer.unref?.();
 
   client.once(Events.ClientReady, (readyClient) => {
     console.log(`Logged in as ${readyClient.user.tag}`);
@@ -113,10 +110,7 @@ async function main(): Promise<void> {
   });
   client.on(Events.InteractionCreate, (interaction) => {
     if (!acceptingEvents || !interaction.guildId || !config.guildIds.includes(interaction.guildId)) return;
-    (async () => {
-      if (await handleAgentInteraction(interaction, store, config)) return;
-      await handleInteraction(interaction, store, config);
-    })().catch((error) => {
+    handleInteraction(interaction, store, config).catch((error) => {
       console.error(error);
       if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
         void interaction.reply({ content: "操作失敗，請稍後再試。", flags: MessageFlags.Ephemeral });
@@ -162,7 +156,6 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     if (!acceptingEvents) return;
     acceptingEvents = false;
-    clearInterval(pendingActionPruneTimer);
     stopHealth();
     await stopEmbeddings();
     client.destroy();

@@ -26,7 +26,6 @@ const config: Config = {
   aiApiKey: "env-key",
   aiModel: "env-model",
   aiEmbeddingModel: "env-embedding",
-  searxngBaseUrl: "http://searxng:8080",
   summaryMessageLimit: 50,
   replyMentionUser: true,
   attachmentMaxBytes: 1024

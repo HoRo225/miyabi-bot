@@ -4,7 +4,7 @@ import { backup, DatabaseSync } from "node:sqlite";
 
 const databasePath = process.env.DATABASE_PATH ?? "/app/data/bot.sqlite";
 const backupDir = process.env.BACKUP_DIR ?? "/backups";
-const keep = Math.max(1, Number.parseInt(process.env.BACKUP_KEEP ?? "14", 10) || 14);
+const keep = Math.max(1, Number.parseInt(process.env.BACKUP_KEEP ?? "5", 10) || 5);
 const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z").replaceAll(/[-:]/g, "");
 const target = join(backupDir, `bot-${timestamp}.sqlite`);
 const partial = `${target}.partial`;
