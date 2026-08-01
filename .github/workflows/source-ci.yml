@@ -3,36 +3,25 @@ name: source-ci
 on:
   pull_request:
     branches: [main]
-  push:
-    branches: [main]
 
-concurrency:
-  group: source-ci-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 jobs:
   validate:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - run: npm audit --audit-level=high
-      - run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t miyabi-bot:ci .
-
-  publish:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     env:
-      IMAGE: ghcr.io/horo225/miyabi-bot
+      BOT_IMAGE: miyabi-bot:git-0000000000000000000000000000000000000000
+      DISCORD_TOKEN: test
+      DISCORD_CLIENT_ID: test
+      DISCORD_GUILD_ID: test
+      NINE_ROUTER_JWT_SECRET: test
+      NINE_ROUTER_API_KEY_SECRET: test
+      NINE_ROUTER_MACHINE_ID_SALT: test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: npm audit --audit-level=high
-      - run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t "$IMAGE:$GITHUB_SHA" .
-      - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - run: docker push "$IMAGE:$GITHUB_SHA"
-      - run: docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - run: sh -n ops/deploy.sh ops/deploy.test.sh ops/bootstrap-9router.sh
+      - run: sh ops/deploy.test.sh
+      - run: docker compose config --quiet
+      - run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t miyabi-bot:ci .
