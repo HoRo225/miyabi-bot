@@ -1,0 +1,105 @@
+name: horo-discord-bot
+
+services:
+  9router:
+    image: decolua/9router:0.5.12@sha256:4927f39da33ce7fc7fdb72c6b173a62397bfa3a4140382e417e44a266ca922a4
+    restart: unless-stopped
+    ports:
+      - "${NINE_ROUTER_BIND_ADDRESS:-127.0.0.1}:20128:20128"
+    environment:
+      DATA_DIR: /app/data
+      PORT: "20128"
+      HOSTNAME: 0.0.0.0
+      NODE_ENV: production
+      BASE_URL: http://127.0.0.1:20128
+      ENABLE_REQUEST_LOGS: "false"
+      JWT_SECRET: ${NINE_ROUTER_JWT_SECRET:?set NINE_ROUTER_JWT_SECRET in .env}
+      API_KEY_SECRET: ${NINE_ROUTER_API_KEY_SECRET:?set NINE_ROUTER_API_KEY_SECRET in .env}
+      MACHINE_ID_SALT: ${NINE_ROUTER_MACHINE_ID_SALT:?set NINE_ROUTER_MACHINE_ID_SALT in .env}
+    volumes:
+      - 9router-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+      - /app/.next/cache:rw,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=64m
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, SETGID, SETUID]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD-SHELL, "node -e \"fetch('http://127.0.0.1:20128/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  bot-prod:
+    image: ${BOT_IMAGE:?set BOT_IMAGE in .env}
+    pull_policy: never
+    restart: unless-stopped
+    stop_grace_period: 45s
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN:?set DISCORD_TOKEN in .env}
+      DISCORD_CLIENT_ID: ${DISCORD_CLIENT_ID:?set DISCORD_CLIENT_ID in .env}
+      DISCORD_GUILD_IDS: ${DISCORD_GUILD_IDS:-}
+      DISCORD_GUILD_ID: ${DISCORD_GUILD_ID:-}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
+      ADMIN_ROLE_IDS: ${ADMIN_ROLE_IDS:-}
+      AI_SETTINGS_USER_IDS: ${AI_SETTINGS_USER_IDS:-}
+      AI_SETTINGS_ROLE_IDS: ${AI_SETTINGS_ROLE_IDS:-}
+      DATABASE_URL: ${DATABASE_URL:-file:./data/bot.sqlite}
+      AI_BASE_URL: ${AI_BASE_URL:-http://9router:20128}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-gemini/gemini-embedding-2-preview}
+      DEFAULT_SUMMARY_MESSAGE_LIMIT: ${DEFAULT_SUMMARY_MESSAGE_LIMIT:-50}
+      REPLY_MENTION_USER: ${REPLY_MENTION_USER:-true}
+      ATTACHMENT_MAX_MB: ${ATTACHMENT_MAX_MB:-10}
+    depends_on:
+      9router:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD-SHELL, "node -e \"const fs=require('node:fs');const h=JSON.parse(fs.readFileSync('/tmp/horo-bot-health.json','utf8'));if(!h.ready||Date.now()-h.timestamp>60000)process.exit(1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  backup:
+    profiles: [ops]
+    image: ${BOT_IMAGE:?set BOT_IMAGE in .env}
+    pull_policy: never
+    user: "1000:1000"
+    command: [node, /app/ops/backup.mjs]
+    environment:
+      DATABASE_PATH: /app/data/bot.sqlite
+      BACKUP_DIR: /backups
+      BACKUP_KEEP: "${BACKUP_KEEP:-5}"
+    volumes:
+      - ./data:/app/data:ro
+      - ./backups:/backups
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=16m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: none
+
+volumes:
+  9router-data:
