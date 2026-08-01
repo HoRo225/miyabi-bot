@@ -29,10 +29,55 @@ jobs:
       packages: write
     env:
       IMAGE: ghcr.io/horo225/miyabi-bot
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - run: npm audit --audit-level=high
       - run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t "$IMAGE:$GITHUB_SHA" .
       - run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - run: docker push "$IMAGE:$GITHUB_SHA"
-      - run: docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - id: image
+        run: |
+          docker push "$IMAGE:$GITHUB_SHA"
+          ref="$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA")"
+          case "$ref" in
+            ghcr.io/horo225/miyabi-bot@sha256:*) ;;
+            *) echo "invalid image digest" >&2; exit 1 ;;
+          esac
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "$ref" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: publish
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: source-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8
+        with:
+          oauth-client-id: ${{ vars.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
+          tags: tag:github-deploy
+          ping: ${{ vars.DEPLOY_HOST }}
+          version: 1.98.4
+      - name: Deploy immutable image
+        env:
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          IMAGE_REF: ${{ needs.publish.outputs.image }}
+        run: |
+          key="$(mktemp)"
+          known_hosts="$(mktemp)"
+          trap 'rm -f "$key" "$known_hosts"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$known_hosts"
+          chmod 600 "$key" "$known_hosts"
+          ssh -o BatchMode=yes -o IdentitiesOnly=yes -o UserKnownHostsFile="$known_hosts" -i "$key" "$DEPLOY_USER@$DEPLOY_HOST" "deploy $GITHUB_SHA $IMAGE_REF"
