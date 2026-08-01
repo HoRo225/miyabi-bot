@@ -2,7 +2,6 @@ import { resolve } from "node:path";
 
 const DEFAULT_AI_BASE_URL = "http://9router:20128";
 const DEFAULT_AI_EMBEDDING_MODEL = "gemini/gemini-embedding-2-preview";
-const DEFAULT_SEARXNG_BASE_URL = "http://searxng:8080";
 
 export type Config = {
   token: string;
@@ -17,7 +16,6 @@ export type Config = {
   aiApiKey: string;
   aiModel: string;
   aiEmbeddingModel: string;
-  searxngBaseUrl: string;
   summaryMessageLimit: number;
   replyMentionUser: boolean;
   attachmentMaxBytes: number;
@@ -97,7 +95,6 @@ export function loadConfig(): Config {
     aiApiKey: aiProvider.apiKey,
     aiModel: aiProvider.model,
     aiEmbeddingModel: envText(process.env, "AI_EMBEDDING_MODEL") ?? DEFAULT_AI_EMBEDDING_MODEL,
-    searxngBaseUrl: envText(process.env, "SEARXNG_BASE_URL") ?? DEFAULT_SEARXNG_BASE_URL,
     summaryMessageLimit: clampInteger(envNumber("DEFAULT_SUMMARY_MESSAGE_LIMIT", 50), 1, 100),
     replyMentionUser: envFlag("REPLY_MENTION_USER", true),
     attachmentMaxBytes: envNumber("ATTACHMENT_MAX_MB", 10) * 1024 * 1024
@@ -106,10 +103,6 @@ export function loadConfig(): Config {
 
 export function resolveAiEnabledSetting(value: string | undefined): boolean {
   return settingBoolean(value, true);
-}
-
-export function resolveAiAgentEnabledSetting(value: string | undefined): boolean {
-  return settingBoolean(value, false);
 }
 
 function requiredEnv(key: string): string {

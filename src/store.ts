@@ -96,22 +96,6 @@ export type BackfillStatus = {
   };
 };
 
-export type AgentActionRisk = "write" | "destructive";
-
-export type AgentPendingAction = {
-  actionId: string;
-  guildId: string;
-  channelId: string;
-  sourceMessageId: string;
-  requesterId: string;
-  requesterName: string | null;
-  toolName: string;
-  arguments: Record<string, unknown>;
-  risk: AgentActionRisk;
-  status: string;
-  expiresAt: string;
-};
-
 const schema = `
 PRAGMA foreign_keys = ON;
 
@@ -300,34 +284,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   result TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS agent_pending_actions (
-  action_id TEXT PRIMARY KEY,
-  guild_id TEXT NOT NULL,
-  channel_id TEXT NOT NULL,
-  source_message_id TEXT NOT NULL,
-  requester_id TEXT NOT NULL,
-  requester_name TEXT,
-  tool_name TEXT NOT NULL,
-  arguments_json TEXT NOT NULL,
-  risk TEXT NOT NULL CHECK (risk IN ('write', 'destructive')),
-  status TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  approved_by TEXT,
-  result_code TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS agent_pending_actions_expiry_idx
-ON agent_pending_actions(status, expires_at);
 `;
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const RUNTIME_SETTING_KEYS = new Set([
   "ai_enabled",
-  "ai_agent_enabled",
-  "ai_agent_probe_model",
   "ai_9router_key_id",
   "ai_model",
   "attachment_max_mb",
@@ -388,7 +349,8 @@ function migrateSchema(db: DatabaseSync): void {
     }
     db.exec("DROP TABLE IF EXISTS url_fetch_logs");
     db.exec("DROP TABLE IF EXISTS deleted_messages");
-    db.prepare("DELETE FROM ai_runtime_settings WHERE key IN ('ai_base_url', 'ai_api_key', 'ai_embedding_model')").run();
+    db.exec("DROP TABLE IF EXISTS agent_pending_actions");
+    db.prepare("DELETE FROM ai_runtime_settings WHERE key IN ('ai_base_url', 'ai_api_key', 'ai_embedding_model', 'ai_agent_enabled', 'ai_agent_probe_model')").run();
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (error) {
@@ -408,7 +370,6 @@ export class Store {
     migrateSchema(this.db);
     ensureSteamFreeSeenItemColumns(this.db);
     this.pruneAiRequestLogs();
-    this.pruneAgentPendingActions();
   }
 
   listAllowedRoles(): string[] {
@@ -1215,112 +1176,6 @@ export class Store {
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at
     `).run(key, value, actor.id, now());
     this.audit(actor, "ai-settings", "set_runtime_setting", "setting", key, redact(key, oldValue), redact(key, value), "ok");
-  }
-
-  createAgentPendingAction(input: {
-    actionId: string;
-    guildId: string;
-    channelId: string;
-    sourceMessageId: string;
-    requester: UserRef;
-    toolName: string;
-    arguments: Record<string, unknown>;
-    risk: AgentActionRisk;
-    expiresAt: string;
-  }): AgentPendingAction {
-    const createdAt = now();
-    this.db.prepare(`
-      INSERT INTO agent_pending_actions
-        (action_id, guild_id, channel_id, source_message_id, requester_id, requester_name,
-         tool_name, arguments_json, risk, status, expires_at, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
-    `).run(
-      input.actionId,
-      input.guildId,
-      input.channelId,
-      input.sourceMessageId,
-      input.requester.id,
-      input.requester.name,
-      input.toolName,
-      JSON.stringify(input.arguments),
-      input.risk,
-      input.expiresAt,
-      createdAt,
-      createdAt
-    );
-    const action = this.agentPendingAction(input.actionId);
-    if (!action) throw new Error("agent_pending_action_create_failed");
-    return action;
-  }
-
-  agentPendingAction(actionId: string): AgentPendingAction | undefined {
-    const row = this.db.prepare(`
-      SELECT action_id, guild_id, channel_id, source_message_id, requester_id, requester_name,
-             tool_name, arguments_json, risk, status, expires_at
-      FROM agent_pending_actions
-      WHERE action_id = ?
-    `).get(actionId) as {
-      action_id: string;
-      guild_id: string;
-      channel_id: string;
-      source_message_id: string;
-      requester_id: string;
-      requester_name: string | null;
-      tool_name: string;
-      arguments_json: string;
-      risk: AgentActionRisk;
-      status: string;
-      expires_at: string;
-    } | undefined;
-    if (!row) return undefined;
-    let args: unknown;
-    try {
-      args = JSON.parse(row.arguments_json);
-    } catch {
-      return undefined;
-    }
-    if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
-    return {
-      actionId: row.action_id,
-      guildId: row.guild_id,
-      channelId: row.channel_id,
-      sourceMessageId: row.source_message_id,
-      requesterId: row.requester_id,
-      requesterName: row.requester_name,
-      toolName: row.tool_name,
-      arguments: args as Record<string, unknown>,
-      risk: row.risk,
-      status: row.status,
-      expiresAt: row.expires_at
-    };
-  }
-
-  claimAgentPendingAction(actionId: string, requesterId: string, approvedBy: string, at = now()): boolean {
-    return this.db.prepare(`
-      UPDATE agent_pending_actions
-      SET status = 'executing', approved_by = ?, updated_at = ?
-      WHERE action_id = ? AND requester_id = ? AND status = 'pending' AND expires_at > ?
-    `).run(approvedBy, at, actionId, requesterId, at).changes > 0;
-  }
-
-  finishAgentPendingAction(actionId: string, status: "completed" | "failed" | "rejected" | "expired", resultCode: string): boolean {
-    const expectedStatus = status === "completed" || status === "failed" ? "executing" : "pending";
-    return this.db.prepare(`
-      UPDATE agent_pending_actions
-      SET status = ?, arguments_json = '{}', result_code = ?, updated_at = ?
-      WHERE action_id = ? AND status = ?
-    `).run(status, resultCode.slice(0, 100), now(), actionId, expectedStatus).changes > 0;
-  }
-
-  pruneAgentPendingActions(at = new Date()): void {
-    const timestamp = at.toISOString();
-    this.db.prepare(`
-      UPDATE agent_pending_actions
-      SET status = 'expired', arguments_json = '{}', result_code = 'expired', updated_at = ?
-      WHERE status = 'pending' AND expires_at <= ?
-    `).run(timestamp, timestamp);
-    const cutoff = new Date(at.getTime() - 24 * 60 * 60_000).toISOString();
-    this.db.prepare("DELETE FROM agent_pending_actions WHERE status != 'pending' AND updated_at < ?").run(cutoff);
   }
 
   setVoiceSetting(key: string, value: string, actor: UserRef): void {

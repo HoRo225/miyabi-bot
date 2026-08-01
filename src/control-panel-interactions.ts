@@ -370,8 +370,6 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
       const options = await fetchAiModelOptions(config);
       if (selected && selected !== currentModel && options.some((option) => option.value === selected)) {
         store.setRuntimeSetting("ai_model", selected, actor);
-        store.setRuntimeSetting("ai_agent_enabled", "false", actor);
-        store.setRuntimeSetting("ai_agent_probe_model", "", actor);
       }
       const keyState = readNineRouterKeyState(config.databasePath);
       await interaction.editReply(aiModelSelectPanelUpdate(

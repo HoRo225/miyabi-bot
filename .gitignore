@@ -10,3 +10,5 @@ logs/
 npm-debug.log*
 server_192.168.1.107_ed25519
 server_192.168.1.107_ed25519.pub
+
+.codebase-memory/

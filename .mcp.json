@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "codebase-memory": {
+      "command": "sh",
+      "args": ["-lc", "exec \"$HOME/.local/bin/codebase-memory-mcp\""]
+    }
+  }
+}

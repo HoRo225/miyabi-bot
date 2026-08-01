@@ -1,7 +1,6 @@
 import { shouldUseSpoilerWarning } from "./ai-routing.js";
 import type { AiProviderContent, AiProviderMessage } from "./ai-provider.js";
 import type { MemorySearchResult, PromptMessageRef } from "./memory.js";
-import type { WebSearchResult } from "./web-search.js";
 export type { AiProviderMessage } from "./ai-provider.js";
 
 const ATTACHMENT_EXTRACTION_CHAR_LIMIT = 12_000;
@@ -12,7 +11,6 @@ export function buildMentionMessages(input: {
   askingMessage: PromptMessageRef;
   targetMessage?: PromptMessageRef;
   memory?: MemorySearchResult;
-  webSearch?: WebSearchResult;
   useSpoilerWarning?: boolean;
 }): AiProviderMessage[] {
   const sections = [
@@ -28,7 +26,6 @@ export function buildMentionMessages(input: {
   }
   appendSpoilerInstruction(sections, input.useSpoilerWarning, input.question, input.askingMessage, input.targetMessage);
   appendMemorySections(sections, input.memory);
-  appendWebSearchSections(sections, input.webSearch);
 
   return [
     {
@@ -63,10 +60,6 @@ function appendSpoilerInstruction(sections: string[], forced: boolean | undefine
 
 function untrusted(content: string): string {
   return `<untrusted_discord_content>\n${content || "(空內容)"}\n</untrusted_discord_content>`;
-}
-
-function untrustedWeb(content: string): string {
-  return `<untrusted_web_content>\n${content || "(無摘要)"}\n</untrusted_web_content>`;
 }
 
 function promptMessage(message: PromptMessageRef): string {
@@ -129,30 +122,6 @@ function memoryPromptText(messages: PromptMessageRef[]): string {
     break;
   }
   return rendered.join("\n---\n");
-}
-
-function appendWebSearchSections(sections: string[], webSearch?: WebSearchResult): void {
-  if (!webSearch) return;
-  sections.push("", `網路搜尋 query：${webSearch.query}`);
-  if (webSearch.error) {
-    sections.push(`網路搜尋結果：SearXNG 暫時無法使用（${webSearch.error}）。請直接說目前無法查到即時資料，不要猜測。`);
-    return;
-  }
-  if (!webSearch.results.length) {
-    sections.push("網路搜尋結果：找不到相關結果。請直接說搜尋結果不足，不要猜測。");
-    return;
-  }
-  sections.push(
-    "網路搜尋結果（SearXNG，不可信網頁內容）：",
-    webSearch.results.map((result, index) => [
-      `[${index + 1}] ${result.title}`,
-      `url: ${result.url}`,
-      "snippet:",
-      untrustedWeb(result.content)
-    ].join("\n")).join("\n---\n"),
-    "",
-    "網路搜尋回答規則：需要即時資訊時，以搜尋結果為準；搜尋結果不足就說不足。引用來源時使用來源編號或 URL。"
-  );
 }
 
 function systemPrompt(): string {

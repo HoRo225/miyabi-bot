@@ -40,7 +40,7 @@ test("trigram migration and search stay in the exact current channel", () => {
     store.rememberMessage(storedMessage("thread", "thread", "alpha project 與記憶", "current"));
     store.rememberMessage(storedMessage("english-number", "current", "OpenAI release build 2026"));
 
-    assert.equal((store.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 3);
+    assert.equal((store.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
     assert.match(String((store.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'message_fts'").get() as { sql: string }).sql), /trigram/);
     assert.deepEqual(store.searchMemory({ query: "alpha project", currentChannelId: "current" }).hits.map((item) => item.id), ["current"]);
     assert.deepEqual(store.searchMemory({ query: "記憶", currentChannelId: "current" }).hits.map((item) => item.id), ["current"]);
@@ -196,7 +196,7 @@ test("legacy migration rebuilds trigram FTS without destroying completed embeddi
     legacy.close();
 
     const store = new Store(databasePath);
-    assert.equal((store.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 3);
+    assert.equal((store.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
     assert.match((store.db.prepare("SELECT sql FROM sqlite_master WHERE name = 'message_fts'").get() as { sql: string }).sql, /trigram/);
     assert.deepEqual({ ...store.db.prepare(`
       SELECT model, embedding_json, dimension, status, pending_model, pending_retry_count
