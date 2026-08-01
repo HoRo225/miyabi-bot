@@ -1,0 +1,12 @@
+.env
+.monitor.env
+backups/
+data/
+dist/
+node_modules/
+logs/
+*.sqlite
+*.sqlite-*
+npm-debug.log*
+server_192.168.1.107_ed25519
+server_192.168.1.107_ed25519.pub

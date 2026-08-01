@@ -1,0 +1,15 @@
+node_modules/
+dist/
+data/
+backups/
+logs/
+.env
+.env.*
+*.sqlite
+*.sqlite-*
+npm-debug.log*
+*.key
+*.pem
+server_192.168.1.107_ed25519*
+.git/
+.agents/

@@ -1,0 +1,24 @@
+{
+  "name": "horo-discord-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:prod": "tsc -p tsconfig.prod.json",
+    "test": "npm run build && node --test dist/*.test.js"
+  },
+  "dependencies": {
+    "discord.js": "14.26.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  },
+  "overrides": {
+    "undici": "6.27.0"
+  }
+}
