@@ -21,7 +21,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - run: npm audit --audit-level=high
-      - run: sh -n ops/deploy.sh ops/deploy.test.sh ops/bootstrap-9router.sh
+      - run: sh -n ops/deploy.sh ops/deploy.test.sh ops/backup.test.sh ops/bootstrap-9router.sh
       - run: sh ops/deploy.test.sh
       - run: docker compose config --quiet
       - run: docker build --build-arg VCS_REF="$GITHUB_SHA" -t miyabi-bot:ci .
+      - run: sh ops/backup.test.sh miyabi-bot:ci
