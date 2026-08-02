@@ -105,7 +105,8 @@ case "$MODE" in
     existing_router_id=$(docker compose ps -aq 9router 2>/dev/null || true)
     if [ -n "$existing_router_id" ]; then
       existing_router_image=$(docker inspect --format '{{.Config.Image}}' "$existing_router_id" 2>/dev/null || true)
-      [ "$existing_router_image" = "decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9" ] || { fixed_error IMAGE-001; exit 1; }
+      # 9router v0.5.45; OCI revision 6fcd27337a7893642c7fe630840d0a641743f28f; linux/amd64 child digest.
+      [ "$existing_router_image" = "decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9" ] || { fixed_error IMAGE-001; exit 1; }
     fi
     docker compose stop 9router >/dev/null 2>&1 || true; password=$(read_bootstrap_password) || exit 2
     [ "${#password}" -ge 16 ] || { unset password; fixed_error SECRET-001; exit 2; }

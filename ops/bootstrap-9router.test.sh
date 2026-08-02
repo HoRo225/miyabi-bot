@@ -12,6 +12,7 @@ write_mocks() {
 #!/bin/sh
 [ -z "${MOCK_CALL_LOG:-}" ] || printf '%s\n' "$*" >>"$MOCK_CALL_LOG"
 case "$*" in
+  *"inspect --format {{.Config.Image}}"*) printf '%s\n' "${MOCK_EXISTING_ROUTER_IMAGE:-}" ;;
   *"ps -aq 9router"*) printf 'test-cid\n' ;;
   *"ps -q 9router"*) printf 'test-cid\n' ;;
   *"port test-cid 20128/tcp"*) printf '%s\n' "${MOCK_BIND:-127.0.0.1:20128}" ;;
@@ -51,14 +52,14 @@ run_sync_key() {
     MIYABI_OPS_LOCK_HELD=1 "$bootstrap" sync-key
 }
 
-# Existing stopped/started router with a non-pinned image is rejected before stop/up.
+# A tag-qualified child digest is rejected before stop/up; production ref must be digest-only.
 root=$(mktemp -d)
 write_mocks
 mkdir -p "$root/status" "$root/data"
 printf 'BOT_IMAGE=test\n' >"$root/.env"
 printf 'StrongBootstrapPass123!\n' >"$root/password"
 chmod 600 "$root/password"
-if output=$(MOCK_CALL_LOG="$root/calls" NINE_ROUTER_BOOTSTRAP_PASSWORD_FILE="$root/password" PROJECT_DIR="$root" PATH="$root/bin:$PATH" MIYABI_OPS_LOCK_HELD=1 "$bootstrap" start 2>&1); then
+if output=$(MOCK_CALL_LOG="$root/calls" MOCK_EXISTING_ROUTER_IMAGE='decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9' NINE_ROUTER_BOOTSTRAP_PASSWORD_FILE="$root/password" PROJECT_DIR="$root" PATH="$root/bin:$PATH" MIYABI_OPS_LOCK_HELD=1 "$bootstrap" start 2>&1); then
   echo "old router image unexpectedly accepted" >&2
   exit 1
 fi

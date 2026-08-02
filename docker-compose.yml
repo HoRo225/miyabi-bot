@@ -2,7 +2,8 @@ name: horo-discord-bot
 
 services:
   9router:
-    image: decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9
+    # 9router v0.5.45; OCI revision 6fcd27337a7893642c7fe630840d0a641743f28f; linux/amd64 child digest.
+    image: decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9
     restart: unless-stopped
     ports:
       - "127.0.0.1:20128:20128"

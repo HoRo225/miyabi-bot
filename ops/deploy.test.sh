@@ -79,7 +79,7 @@ mock_docker() {
       case "$*" in
         *RestartCount*) printf '0\n'; exit 0 ;;
         *Config.Image*)
-          printf '%s\n' "${MOCK_ROUTER_REF:-decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9}"
+          printf '%s\n' "${MOCK_ROUTER_REF:-decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9}"
           exit 0
           ;;
       esac
@@ -124,7 +124,7 @@ mkdir -p "$test_root/data" "$test_root/backups" "$test_root/state"
 cat > "$test_root/docker-compose.yml" <<'YAML'
 services:
   9router:
-    image: decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9
+    image: decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9
 YAML
 cp "$test_root/docker-compose.yml" "$test_root/docker-compose.yml.base"
 ln -s "$self" "$test_root/mock-git"
@@ -173,7 +173,7 @@ run_deploy() {
   MOCK_CANDIDATE="$candidate" \
   MOCK_STALE="$stale" \
   MOCK_ROUTER_CONTAINER="${MOCK_ROUTER_CONTAINER:-1}" \
-  MOCK_ROUTER_REF="${MOCK_ROUTER_REF:-decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9}" \
+  MOCK_ROUTER_REF="${MOCK_ROUTER_REF:-decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9}" \
   MOCK_BACKUP_SYMLINK="${MOCK_BACKUP_SYMLINK:-0}" \
   MOCK_DB_CHECK_FAIL="${MOCK_DB_CHECK_FAIL:-0}" \
   MOCK_EXPECT_DB="${MOCK_EXPECT_DB:-}" \
@@ -300,7 +300,7 @@ assert_rejected_before_build
 
 write_env
 reset_case
-if MOCK_ROUTER_REF='decolua/9router:0.5.12@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' run_deploy >/dev/null 2>&1; then
+if MOCK_ROUTER_REF='decolua/9router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' run_deploy >/dev/null 2>&1; then
   echo "router image ref mismatch unexpectedly accepted" >&2
   exit 1
 fi
@@ -308,9 +308,27 @@ assert_rejected_before_build
 
 write_env
 reset_case
-sed -i 's#decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9#decolua/9router:latest#' "$test_root/docker-compose.yml"
+sed -i 's#decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9#decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9#' "$test_root/docker-compose.yml"
+if MOCK_ROUTER_REF=decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9 run_deploy >/dev/null 2>&1; then
+  echo "tagged router digest ref unexpectedly accepted" >&2
+  exit 1
+fi
+assert_rejected_before_build
+
+write_env
+reset_case
+sed -i 's#decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9#decolua/9router:latest#' "$test_root/docker-compose.yml"
 if MOCK_ROUTER_REF=decolua/9router:latest run_deploy >/dev/null 2>&1; then
   echo "floating router image ref unexpectedly accepted" >&2
+  exit 1
+fi
+assert_rejected_before_build
+
+write_env
+reset_case
+sed -i 's#decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9#decolua/9router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa#' "$test_root/docker-compose.yml"
+if MOCK_ROUTER_REF=decolua/9router@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa run_deploy >/dev/null 2>&1; then
+  echo "wrong digest-only router image ref unexpectedly accepted" >&2
   exit 1
 fi
 assert_rejected_before_build

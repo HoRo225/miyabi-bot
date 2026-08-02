@@ -7,6 +7,7 @@ docker_bin="${DOCKER_BIN:-docker}"
 git_bin="${GIT_BIN:-git}"
 state_dir="${STATE_DIR:-$HOME/.local/state}"
 ops_lock_file="${OPS_LOCK_FILE:-/tmp/horo-discord-bot-ops.lock}"
+pinned_router_ref='decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
 mkdir -p "$(dirname "$ops_lock_file")"
 exec 9>"$ops_lock_file"
 flock -n 9 || { echo "deployment already running" >&2; exit 1; }
@@ -99,12 +100,12 @@ router_release_state() {
 
 router_image_from_compose() {
   sed -n 's/^[[:space:]]*image:[[:space:]]*//p' docker-compose.yml |
-    sed -n '/decolua\/9router:/p' | head -n 1
+    sed -n '/decolua\/9router[@:]/p' | head -n 1
 }
 
 router_ref_pinned() {
   case "$1" in
-    decolua/9router:*@sha256:*) digest=${1##*@sha256:};;
+    decolua/9router@sha256:*|decolua/9router:*@sha256:*) digest=${1##*@sha256:};;
     *) return 1;;
   esac
   [ "${#digest}" -eq 64 ] || return 1
@@ -117,6 +118,7 @@ assert_router_release_ready() {
   [ -f docker-compose.yml ] || { echo 'docker-compose.yml missing' >&2; return 1; }
   target_router="$(router_image_from_compose)"
   router_ref_pinned "$target_router" || { echo 'router image must be digest pinned' >&2; return 1; }
+  [ "$target_router" = "$pinned_router_ref" ] || { echo 'router image must use the fixed digest-only ref' >&2; return 1; }
   router_id="$(compose ps -q 9router 2>/dev/null || true)"
   [ -n "$router_id" ] || { echo 'running router container missing' >&2; return 1; }
   running_router="$($docker_bin inspect --format '{{.Config.Image}}' "$router_id" 2>/dev/null || true)"

@@ -5,6 +5,7 @@ umask 077
 FIXED_DIGEST=sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9
 FIXED_REVISION=6fcd27337a7893642c7fe630840d0a641743f28f
 FIXED_PLATFORM=linux/amd64
+FIXED_IMAGE=decolua/9router@$FIXED_DIGEST
 die() { printf '9R-CANDIDATE-%s\n' "$1" >&2; exit "$2"; }
 expected_digest_override=$(printenv CANDIDATE_EXPECTED_DIGEST 2>/dev/null || true)
 expected_revision_override=$(printenv CANDIDATE_EXPECTED_REVISION 2>/dev/null || true)
@@ -60,7 +61,7 @@ need IMAGE "$CANDIDATE_IMAGE" IMAGE-001 12
 need GEMINI_KEY "$CANDIDATE_GEMINI_KEY_FILE$CANDIDATE_GEMINI_KEY_FD" SECRET-004 15
 need VOLUME "$CANDIDATE_VOLUME" VOLUME-001 13
 need CLIENT_KEY_ID "$CANDIDATE_CLIENT_KEY_ID_FILE" CLIENT-001 14
-[ "$CANDIDATE_IMAGE" = "decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9" ] || die IMAGE-002 16
+[ "$CANDIDATE_IMAGE" = "$FIXED_IMAGE" ] || die IMAGE-002 16
 case "$CANDIDATE_MARKER" in *[!A-Za-z0-9._-]*) die MARKER-001 17;; esac
 case "$CANDIDATE_URL" in http://127.0.0.1:[0-9]*) ;; *) die LOOPBACK-001 18;; esac
 candidate_port=$(printf '%s' "$CANDIDATE_URL" | sed -n 's#^http://[^:]*:\([0-9][0-9]*\)$#\1#p')

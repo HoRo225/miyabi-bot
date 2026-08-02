@@ -31,7 +31,7 @@ case "$scenario:$*" in
   *"image inspect --format {{json .RepoDigests}}"*) printf '%s\n' '["decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9"]' ;;
   *"manifest inspect --verbose decolua/9router@sha256:"*) printf '%s\n' '{"Descriptor":{"digest":"sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9","platform":{"architecture":"amd64","os":"linux"}},"SchemaV2Manifest":{}}' ;;
   *"image inspect --format {{index .Config.Labels"*) printf '6fcd27337a7893642c7fe630840d0a641743f28f\n' ;;
-  *"inspect --format {{.Config.Image}}"*) printf 'decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9\n' ;;
+  *"inspect --format {{.Config.Image}}"*) printf 'decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9\n' ;;
   *"inspect --format {{range .Mounts"*) printf 'candidate-volume\n' ;;
   *"port candidate-cid 20128/tcp"*) printf '127.0.0.1:20129\n' ;;
   *"exec candidate-cid"*"grep -R"*) exit 1 ;;
@@ -83,13 +83,13 @@ exec /usr/bin/grep "$@"
 EOF
 chmod 700 "$root/bin/grep"
 
-IMAGE='decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
+IMAGE='decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
 run_validator() {
   scenario=$1
   PATH="$root/bin:$PATH" MOCK_SCENARIO="$scenario" MOCK_USAGE_FILE="$root/usage-$scenario" MOCK_ARG_LOG="$root/args-$scenario" \
     MOCK_SECRET_PASSWORD_FILE="$root/password" MOCK_SECRET_GEMINI_FILE="$root/gemini" MOCK_SECRET_API_FILE="$root/api-key" \
     MOCK_GREP_ARG_LOG="$root/grep-$scenario" \
-    CANDIDATE_URL="${TEST_URL:-http://127.0.0.1:20129}" CANDIDATE_CONTAINER=candidate-cid CANDIDATE_IMAGE="$IMAGE" \
+    CANDIDATE_URL="${TEST_URL:-http://127.0.0.1:20129}" CANDIDATE_CONTAINER=candidate-cid CANDIDATE_IMAGE="${TEST_IMAGE:-$IMAGE}" \
     CANDIDATE_VOLUME="${TEST_VOLUME:-candidate-volume}" CANDIDATE_MANIFEST_FILE="${TEST_MANIFEST_FILE-$root/manifest.json}" \
     CANDIDATE_PASSWORD_FILE="${TEST_PASSWORD_FILE:-$root/password}" CANDIDATE_GEMINI_KEY_FILE="${TEST_GEMINI_FILE:-$root/gemini}" CANDIDATE_API_KEY_FILE="${TEST_API_FILE:-$root/api-key}" \
     CANDIDATE_CLIENT_KEY_ID_FILE="${TEST_ID_FILE:-$root/client-id}" CANDIDATE_MARKER=marker-123 \
@@ -142,6 +142,9 @@ expect_secret_log_fail() {
   assert_clean "$output" "$root/args-$label" "$root/grep-$label"
 }
 expect_success happy
+TEST_IMAGE='decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
+expect_preflight_fail tag-child-image IMAGE-002
+unset TEST_IMAGE
 TEST_MANIFEST_FILE=
 expect_success manifest-fetch
 unset TEST_MANIFEST_FILE

@@ -13,7 +13,7 @@ ops_lock_file=${OPS_LOCK_FILE:-/tmp/horo-discord-bot-ops.lock}
 state_dir=${ROUTER_RELEASE_STATE_DIR:-${STATE_DIR:-$root_dir/data/status}}
 manifest_path=${ROUTER_RELEASE_MANIFEST:-${MANIFEST_PATH:-$state_dir/router-release.manifest}}
 release_script=${ROUTER_RELEASE_SCRIPT:-$0}
-pinned_router_image='decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
+pinned_router_image='decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
 pinned_router_revision='6fcd27337a7893642c7fe630840d0a641743f28f'
 new_router_image=$pinned_router_image
 new_router_revision=$pinned_router_revision
@@ -82,7 +82,7 @@ valid_sha40() { [ "${#1}" -eq 40 ] || return 1; case "$1" in *[!0-9a-f]*) return
 valid_image() {
   case "$1" in
     miyabi-bot:git-*) valid_sha40 "${1#miyabi-bot:git-}";;
-    decolua/9router:*@sha256:*) valid_sha "${1##*@sha256:}";;
+    decolua/9router@sha256:*|decolua/9router:*@sha256:*) valid_sha "${1##*@sha256:}";;
     *) return 1;;
   esac
 }
@@ -249,6 +249,7 @@ validate_manifest_artifacts() {
   case "$db_backup" in "$root_dir/backups/"*) ;; *) die 'database backup path invalid';; esac
   case "$db_backup" in *'/../'*|*/..|*'/./'*|*/.) die 'database backup path traversal';; esac
   [ ! -L "$root_dir/backups" ] || die 'backups directory must not be symlink'
+  [ ! -L "$db_backup" ] || die 'database backup must not be symlink'
   [ -f "$db_backup" ] || die 'database backup missing'
   valid_sha "$db_backup_sha256" || die 'database backup hash missing'
   [ "$(file_hash "$db_backup")" = "$db_backup_sha256" ] || die 'database backup hash mismatch'
@@ -452,32 +453,44 @@ inspect_router() {
       [ -n "$old_router_revision" ] || old_router_revision=$("$docker_bin" inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$router_container" 2>/dev/null || true)
       [ -n "$old_volume" ] || old_volume=$("$docker_bin" inspect --format '{{range .Mounts}}{{if eq .Destination "/app/data"}}{{.Name}}{{end}}{{end}}' "$router_container" 2>/dev/null || true)
     fi
-    [ -n "$old_router_image" ] || old_router_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$root_dir/docker-compose.yml" | sed -n '/decolua\\/9router:/p' | head -n 1)
+    [ -n "$old_router_image" ] || old_router_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$root_dir/docker-compose.yml" | sed -n '/^decolua\/9router[@:]/p' | head -n 1)
     [ -n "$old_volume" ] || old_volume=${PRODUCTION_ROUTER_OLD_VOLUME:-horo-discord-bot_9router-data}
   fi
   [ -n "$old_router_image" ] || die 'unable to inspect old router image'
   [ -n "$old_router_revision" ] || die 'unable to inspect old router revision'
   valid_volume "$old_volume" || die 'old volume invalid'
+  valid_image "$old_router_image" || die 'old router image ref invalid'
+  case "$old_router_image" in
+    decolua/9router@sha256:*|decolua/9router:*@sha256:*) valid_sha "${old_router_image##*@sha256:}" || die 'old router image digest invalid';;
+    *) die 'old router image must be digest pinned';;
+  esac
   if [ "$dry_run" != 1 ]; then
-    valid_image "$old_router_image" || die 'old router image ref invalid'
-    case "$old_router_image" in
-      decolua/9router:*@sha256:*) valid_sha "${old_router_image##*@sha256:}" || die 'old router image digest invalid';;
-      *) die 'old router image must be digest pinned';;
-    esac
     valid_sha40 "$old_router_revision" || die 'old router revision invalid'
   fi
 }
-backup_database() {
-  if [ "$dry_run" = 1 ]; then
-    db_backup=${ROUTER_RELEASE_BACKUP_PATH:-$root_dir/backups/router-release-dry-run.sqlite}
-    mkdir -p "$root_dir/backups"; [ ! -L "$db_backup" ] || die 'database backup target must not be symlink'; : > "$db_backup"; chmod 600 "$db_backup"
-    db_backup_sha256=$(file_hash "$db_backup"); valid_sha "$db_backup_sha256" || die 'database backup hash invalid'; return
+ensure_backups_dir() {
+  [ ! -L "$root_dir/backups" ] || die 'backups directory must not be symlink'
+  if [ -e "$root_dir/backups" ] && [ ! -d "$root_dir/backups" ]; then
+    die 'backups path must be a directory'
   fi
   mkdir -p "$root_dir/backups"
+  [ ! -L "$root_dir/backups" ] || die 'backups directory must not be symlink'
+  [ -d "$root_dir/backups" ] || die 'backups path must be a directory'
+}
+backup_database() {
+  ensure_backups_dir
+  if [ "$dry_run" = 1 ]; then
+    db_backup=${ROUTER_RELEASE_BACKUP_PATH:-$root_dir/backups/router-release-dry-run.sqlite}
+    [ ! -L "$db_backup" ] || die 'database backup target must not be symlink'; : > "$db_backup"; chmod 600 "$db_backup"
+    ensure_backups_dir
+    db_backup_sha256=$(file_hash "$db_backup"); valid_sha "$db_backup_sha256" || die 'database backup hash invalid'; return
+  fi
+  ensure_backups_dir
   output=$(BOT_IMAGE="$old_bot_image" compose_prod --profile ops run --rm --no-deps -T backup 2>/dev/null) || die 'database backup failed'
+  ensure_backups_dir
   name=$(printf '%s\n' "$output" | tail -n 1 | sed 's#^/backups/##')
   case "$name" in bot-[0-9]*T[0-9]*Z.sqlite) ;; *) die 'backup output invalid';; esac
-  db_backup=$root_dir/backups/$name; [ -f "$db_backup" ] || die 'backup file missing'; [ ! -L "$db_backup" ] || die 'backup file must not be symlink'; chmod 600 "$db_backup"
+  db_backup=$root_dir/backups/$name; [ ! -L "$db_backup" ] || die 'database backup must not be symlink'; [ -f "$db_backup" ] || die 'backup file missing'; chmod 600 "$db_backup"
   db_backup_sha256=$(file_hash "$db_backup"); valid_sha "$db_backup_sha256" || die 'database backup hash invalid'
 }
 write_secret_file() {
@@ -762,6 +775,7 @@ prepare() {
   [ "$production_port" = "$expected_production_port" ] || die 'production port is not fixed loopback port'
   [ "$candidate_port" = "$expected_candidate_port" ] || die 'candidate port is not fixed isolation port'
   valid_port "$candidate_port" || die 'candidate port invalid'; [ "$candidate_port" != "$production_port" ] || die 'candidate port equals production'
+  ensure_backups_dir
   acquire_lock
   prepare_active=1
   trap prepare_abort EXIT INT TERM
@@ -862,8 +876,11 @@ restore_volume_swap() {
   remove_volume_exact "$new_volume"; volume_swapped=0
 }
 restore_database() {
+  [ ! -L "$root_dir/backups" ] || { printf '%s\n' 'backups directory must not be symlink' >&2; return 1; }
+  [ -d "$root_dir/backups" ] || { printf '%s\n' 'backups path must be a directory' >&2; return 1; }
   case "$db_backup" in "$root_dir/backups/"*) ;; *) printf '%s\n' 'db backup path invalid' >&2; return 1;; esac
   case "$db_backup" in *'/../'*|*/..|*'/./'*|*/.) printf '%s\n' 'db backup path traversal' >&2; return 1;; esac
+  [ ! -L "$db_backup" ] || { printf '%s\n' 'database backup must not be symlink' >&2; return 1; }
   [ -f "$db_backup" ] || { printf '%s\n' 'db backup missing' >&2; return 1; }
   valid_sha "$db_backup_sha256" || { printf '%s\n' 'db backup hash missing' >&2; return 1; }
   [ "$(file_hash "$db_backup")" = "$db_backup_sha256" ] || { printf '%s\n' 'db backup hash mismatch' >&2; return 1; }

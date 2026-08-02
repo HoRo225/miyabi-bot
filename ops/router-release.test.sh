@@ -33,7 +33,7 @@ new_dashboard='new-dashboard-password'
 old_provider='old-gemini-provider-key'
 new_provider='new-gemini-provider-key'
 old_router='decolua/9router:0.5.12@sha256:1111111111111111111111111111111111111111111111111111111111111111'
-new_router='decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
+new_router='decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9'
 old_volume='horo-discord-bot_9router-data'
 new_volume='horo-discord-bot_9router-v0545'
 old_bot='miyabi-bot:git-cccccccccccccccccccccccccccccccccccccccc'
@@ -136,7 +136,7 @@ case "$1" in
       *"stop 9router bot-prod"*) [ "${MOCK_PROD_STOP_FAIL:-0}" = 1 ] && exit 77 ;;
     esac
     case "$*" in
-      *"ps -q 9router"*) printf 'router-cid\n' ;;
+      *"ps -q 9router"*) [ "${MOCK_ROUTER_CONTAINER:-1}" = 1 ] && printf 'router-cid\n' ;;
       *"ps -q bot-prod"*) printf 'bot-cid\n' ;;
       *"--profile ops run"*backup*)
         mkdir -p "$MOCK_ROOT/backups"
@@ -390,6 +390,19 @@ assert_formal_override_rejected formal-reject-ROUTER_RELEASE_SKIP_GIT_CHECK ROUT
 assert_formal_override_rejected formal-reject-ROUTER_RELEASE_SKIP_BUILD ROUTER_RELEASE_SKIP_BUILD 1 'ROUTER_RELEASE_SKIP_BUILD is test/dry-run only'
 assert_formal_override_rejected formal-reject-ROUTER_WATCHDOG_ONCE ROUTER_WATCHDOG_ONCE 1 'ROUTER_WATCHDOG_ONCE is test/dry-run only'
 assert_formal_override_rejected formal-reject-MIYABI_OPS_LOCK_HELD MIYABI_OPS_LOCK_HELD 1 'MIYABI_OPS_LOCK_HELD is test/dry-run only'
+assert_formal_override_rejected formal-reject-ROUTER_RELEASE_IMAGE ROUTER_RELEASE_IMAGE 'decolua/9router:0.5.45@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9' 'router release image override is not the pinned official image'
+phase=formal-accept-ROUTER_RELEASE_IMAGE-digest-only
+run_case
+export ROUTER_RELEASE_TEST_MODE=0 ROUTER_RELEASE_DRY_RUN=0 ROUTER_RELEASE_DISABLE_WATCHDOG=0 MIYABI_OPS_LOCK_HELD=0
+export ROUTER_RELEASE_SCRIPT= ROUTER_RELEASE_SKIP_GIT_CHECK=0 ROUTER_RELEASE_SKIP_BUILD=0 ROUTER_WATCHDOG_ONCE=0
+export ROUTER_DISCORD_VALIDATE_CMD= ROUTER_PROVISION_CMD= ROUTER_VALIDATE_CMD= ROUTER_VALIDATOR=
+export ROUTER_CANARY_CMD= ROUTER_SYNC_KEY_CMD= ROUTER_PRODUCTION_VALIDATE_CMD=
+export ROUTER_FORMAL_CANARY_CMD= ROUTER_PRODUCTION_CANARY_CMD= ROUTER_CLEANUP_CMD= ROUTER_MARKER_CHECK_CMD=
+export DOCKER_BIN=docker GIT_BIN=git CRONTAB_BIN=crontab CURL_BIN=curl SHA256_BIN=sha256sum DATE_BIN=date
+export ROUTER_RELEASE_IMAGE="$new_router"
+formal_output=$(run_release status 2>&1) || { printf '%s\n' "$formal_output" >&2; echo "formal digest-only image override unexpectedly rejected" >&2; exit 1; }
+printf '%s\n' "$formal_output" | grep -Fxq 'state=none' || { printf '%s\n' "$formal_output" >&2; echo "formal digest-only status output invalid" >&2; exit 1; }
+[ ! -e /tmp/horo-test-ops.lock ] || { echo "formal digest-only status acquired operations lock" >&2; exit 1; }
 phase=formal-reject-NEW_BOT_IMAGE
 run_case
 export ROUTER_RELEASE_TEST_MODE=0 ROUTER_RELEASE_DRY_RUN=0 ROUTER_RELEASE_DISABLE_WATCHDOG=0 MIYABI_OPS_LOCK_HELD=0
@@ -415,6 +428,33 @@ phase=dry-run-hook-fixture
 run_case
 ROUTER_RELEASE_TEST_MODE=0 ROUTER_RELEASE_DRY_RUN=1 run_release prepare >/dev/null 2>&1 || { echo "dry-run hook fixture failed" >&2; exit 1; }
 [ -f "$manifest" ] || { echo "dry-run hook fixture did not create manifest" >&2; exit 1; }
+phase=dry-run-compose-digest-only-no-container
+run_case
+unset OLD_ROUTER_IMAGE OLD_ROUTER_REVISION OLD_ROUTER_VOLUME
+dry_run_old_revision=dddddddddddddddddddddddddddddddddddddddd
+if dry_run_output=$(MOCK_ROUTER_CONTAINER=0 OLD_ROUTER_REVISION="$dry_run_old_revision" OLD_ROUTER_VOLUME="$old_volume" ROUTER_RELEASE_TEST_MODE=0 ROUTER_RELEASE_DRY_RUN=1 run_release prepare 2>&1); then
+  [ "$(field old_router_image)" = "$new_router" ] || { echo "dry-run did not parse digest-only compose router image" >&2; exit 1; }
+  [ "$(field old_router_revision)" = "$dry_run_old_revision" ] || { echo "dry-run old router revision changed unexpectedly" >&2; exit 1; }
+  [ "$(field old_volume)" = "$old_volume" ] || { echo "dry-run old router volume changed unexpectedly" >&2; exit 1; }
+else
+  printf '%s\n' "$dry_run_output" >&2
+  echo "dry-run did not accept digest-only compose router image without a container" >&2
+  exit 1
+fi
+compose_dry_run_base="$root/docker-compose.dry-run-base"
+cp "$root/docker-compose.yml" "$compose_dry_run_base"
+for bad_router_image in 'decolua/9router:latest' 'example/not-router:latest'; do
+  phase=dry-run-reject-$bad_router_image
+  run_case
+  cp "$compose_dry_run_base" "$root/docker-compose.yml"
+  sed -i "s#${new_router}#${bad_router_image}#" "$root/docker-compose.yml"
+  if MOCK_ROUTER_CONTAINER=0 OLD_ROUTER_REVISION="$dry_run_old_revision" OLD_ROUTER_VOLUME="$old_volume" ROUTER_RELEASE_TEST_MODE=0 ROUTER_RELEASE_DRY_RUN=1 run_release prepare >/dev/null 2>&1; then
+    echo "dry-run accepted malformed/non-router image: $bad_router_image" >&2
+    exit 1
+  fi
+done
+cp "$compose_dry_run_base" "$root/docker-compose.yml"
+rm -f "$compose_dry_run_base"
 phase=reject-world-readable-secret
 run_case
 bad_secret="$root/router-secrets.bad"
@@ -534,6 +574,21 @@ if ROUTER_RELEASE_REVISION='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' run_releas
   exit 1
 fi
 assert_preflight_no_side_effects
+phase=reject-backups-directory-symlink-before-side-effects
+run_case
+rm -rf "$root/backups"
+mkdir -p "$root/backups-target"
+printf 'backup-referent-sentinel\n' > "$root/backups-target/sentinel"
+ln -s "$root/backups-target" "$root/backups"
+if run_release prepare >/dev/null 2>&1; then
+  echo "symlinked backups directory unexpectedly accepted" >&2
+  exit 1
+fi
+grep -Fxq 'backup-referent-sentinel' "$root/backups-target/sentinel"
+cmp -s "$root/.env" "$root/env.base"
+assert_preflight_no_side_effects
+rm -f "$root/backups"
+mkdir -p "$root/backups"
 phase=reject-secret-duplicate
 run_case
 duplicate_secret="$root/router-secrets.duplicate"
@@ -763,6 +818,52 @@ if run_release cutover >/dev/null 2>&1; then
   exit 1
 fi
 ! grep -Eq '^state=rolled_back$' "$manifest" || { echo "database restore failure incorrectly marked rolled_back" >&2; exit 1; }
+
+phase=db-backup-symlink-cutover
+run_case
+run_release prepare >/dev/null 2>&1 || { echo "db backup symlink cutover prepare failed" >&2; exit 1; }
+assert_manifest
+backup_path=$(field db_backup)
+backup_referent="$root/db-backup-referent-cutover.sqlite"
+cp "$backup_path" "$backup_referent"
+chmod 600 "$backup_referent"
+backup_referent_hash=$(sha256sum "$backup_referent" | awk '{print $1}')
+rm -f "$backup_path"
+ln -s "$backup_referent" "$backup_path"
+if run_release cutover >/dev/null 2>&1; then
+  echo "symlinked database backup cutover unexpectedly accepted" >&2
+  exit 1
+fi
+[ "$(sha256sum "$backup_referent" | awk '{print $1}')" = "$backup_referent_hash" ]
+[ -f "$manifest" ] || { echo "manifest removed after database backup symlink rejection" >&2; exit 1; }
+rm -f "$backup_path"
+cp "$backup_referent" "$backup_path"
+chmod 600 "$backup_path"
+
+phase=db-backup-symlink-rollback
+run_case
+printf 'rollback-db-sentinel\n' > "$root/data/bot.sqlite"
+run_release prepare >/dev/null 2>&1 || { echo "db backup symlink rollback prepare failed" >&2; exit 1; }
+assert_manifest
+backup_path=$(field db_backup)
+backup_referent="$root/db-backup-referent-rollback.sqlite"
+cp "$backup_path" "$backup_referent"
+chmod 600 "$backup_referent"
+backup_referent_hash=$(sha256sum "$backup_referent" | awk '{print $1}')
+database_hash_before=$(sha256sum "$root/data/bot.sqlite" | awk '{print $1}')
+rm -f "$backup_path"
+ln -s "$backup_referent" "$backup_path"
+if run_release rollback >/dev/null 2>&1; then
+  echo "symlinked database backup rollback unexpectedly accepted" >&2
+  exit 1
+fi
+[ "$(sha256sum "$backup_referent" | awk '{print $1}')" = "$backup_referent_hash" ]
+[ "$(sha256sum "$root/data/bot.sqlite" | awk '{print $1}')" = "$database_hash_before" ]
+[ -f "$manifest" ] || { echo "manifest removed after database backup rollback rejection" >&2; exit 1; }
+! grep -Eq '^state=rolled_back$' "$manifest" || { echo "database backup symlink rollback incorrectly marked rolled_back" >&2; exit 1; }
+rm -f "$backup_path"
+cp "$backup_referent" "$backup_path"
+chmod 600 "$backup_path"
 
 phase=compose-hash-tamper
 run_case
