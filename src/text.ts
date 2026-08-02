@@ -5,6 +5,16 @@ function escapeRegExp(value: string): string {
 export function safeMentions(text: string): string {
   return text.replace(/@(everyone|here|[!&]?\d{17,20})/g, "@\u200b$1");
 }
+export const DISCORD_ERROR_TEXT = {
+  permission: (command: string) => "⚠️ 權限不足\n-# " + command + " 需要管理員授權的身分組，請洽伺服器管理員。",
+  cooldown: "⏳ 請稍候\n-# 距離上次提問未滿 10 秒。",
+  busy: "⏳ 忙線中\n-# 目前有 2 個請求處理中，稍後再試。",
+  aiUnavailable: (code: string) => "🔴 AI 服務暫時不可用\n-# 錯誤代碼 " + code + "，請稍後再試。",
+  channelDisabled: "⚫ 此頻道未啟用 AI\n-# 請管理員在 /settings 開啟。",
+  aiDisabled: "⚫ AI 功能目前停用\n-# 請管理員在 /settings 確認設定。",
+  invalidVoiceSettings: "⚠️ 輸入無效\n-# 人數上限請填 0–99 整數；房主管理請填開啟或關閉。",
+  interactionFailed: "🔴 操作失敗\n-# 請重新執行指令。"
+} as const;
 
 export function stripBotMention(content: string, botUserId: string): string {
   return content.replace(new RegExp(`<@!?${escapeRegExp(botUserId)}>`, "g"), "").trim();
@@ -17,7 +27,7 @@ export function splitDiscordText(text: string, limit = 2000): string[] {
   for (let index = 0; index < text.length; index += chunkLimit) {
     chunks.push(text.slice(index, index + chunkLimit));
   }
-  return chunks.map((chunk, index) => `[${index + 1}/${chunks.length}]\n${chunk}`);
+  return chunks.map((chunk, index) => `${chunk}\n\n-# 第 ${index + 1} / ${chunks.length} 段`);
 }
 
 type DiscordTimestampStyle = "d" | "t" | "R";

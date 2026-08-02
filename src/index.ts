@@ -26,6 +26,7 @@ import {
 } from "./discord-message-runtime.js";
 import { startSteamFreeWorker } from "./steam-free-runtime.js";
 import { Store } from "./store.js";
+import { DISCORD_ERROR_TEXT } from "./text.js";
 import {
   cleanupKnownTempVoiceChannels,
   handleVoiceStateUpdate
@@ -113,7 +114,7 @@ async function main(): Promise<void> {
     handleInteraction(interaction, store, config).catch((error) => {
       console.error(error);
       if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
-        void interaction.reply({ content: "操作失敗，請稍後再試。", flags: MessageFlags.Ephemeral });
+        void interaction.reply({ content: DISCORD_ERROR_TEXT.interactionFailed, flags: MessageFlags.Ephemeral });
       }
     });
   });

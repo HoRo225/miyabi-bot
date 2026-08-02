@@ -26,7 +26,7 @@ import {
 import { attachmentLimitError, resolvePromptMessageRef } from "./prompt-message-ref.js";
 import { runtimeSettingsFromStore } from "./runtime-settings.js";
 import { Store } from "./store.js";
-import { safeMentions, splitDiscordText, stripBotMention } from "./text.js";
+import { DISCORD_ERROR_TEXT, safeMentions, splitDiscordText, stripBotMention } from "./text.js";
 
 type SendableChannel = {
   send(options: unknown): Promise<unknown>;
@@ -222,10 +222,10 @@ export async function handleAiMention(message: Message, client: Client, store: S
   const access = aiAccessForMessage(message, store, config);
   if (!access.ok) {
     if (access.reason === "channel") {
-      await message.reply({ content: "此頻道尚未啟用 AI 功能", allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
+      await message.reply({ content: DISCORD_ERROR_TEXT.channelDisabled, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
     }
     if (access.reason === "disabled") {
-      await message.reply({ content: "AI 功能目前已停用", allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
+      await message.reply({ content: DISCORD_ERROR_TEXT.aiDisabled, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
     }
     return;
   }
@@ -239,11 +239,11 @@ export async function handleAiMention(message: Message, client: Client, store: S
   const admission = claimAiRequest(message.id, message.author.id);
   if (admission === "duplicate") return;
   if (admission === "cooldown") {
-    await message.reply({ content: "請稍候 10 秒再詢問。", allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
+    await message.reply({ content: DISCORD_ERROR_TEXT.cooldown, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
     return;
   }
   if (admission === "busy") {
-    await message.reply({ content: "目前已有兩個 AI 請求處理中，請稍後再試。", allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
+    await message.reply({ content: DISCORD_ERROR_TEXT.busy, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
     return;
   }
 
@@ -314,7 +314,7 @@ export async function handleAiMention(message: Message, client: Client, store: S
       errorType: normalized.logType
     });
     await message.reply({
-      content: `目前 AI 服務暫時不可用，請稍後再試。\n錯誤代碼：${normalized.userCode}`,
+      content: DISCORD_ERROR_TEXT.aiUnavailable(normalized.userCode),
       allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser }
     });
   } finally {

@@ -8,7 +8,7 @@ import { parseModelOptionsFromModelsResponse, parseOpenAiChatResponseText, parse
 import { regexIntentRoute, shouldSearchMemory, shouldUseRecentContext, shouldUseSpoilerWarning } from "./ai-routing.js";
 import { parseIds, resolveAiEnabledSetting, resolveAiProviderConfig, resolveRuntimeSettings } from "./config.js";
 import { controlPanelTimerKey, handleInteraction } from "./control-panel-interactions.js";
-import { ADMIN_NAV_MODULES, SETTINGS_NAV_MODULES, adminModuleFromValue, aiSettingsPanelMessage, settingsModuleFromValue } from "./control-panels.js";
+import { ADMIN_NAV_MODULES, SETTINGS_NAV_MODULES, adminModuleFromValue, adminPanelMessage, aiSettingsPanelMessage, settingsModuleFromValue, settingsPanelMessage } from "./control-panels.js";
 import { isLikelyImageAttachment, isLikelyTextAttachment } from "./guards.js";
 import { canRememberInChannel, cosineSimilarity, ftsQueryFromText, selectedIdChanges } from "./memory.js";
 import { canUseAi, canUseSettings } from "./permissions.js";
@@ -54,6 +54,52 @@ test("AI settings panel only exposes 9router controls", () => {
   assert.doesNotMatch(serialized, /ai:test-agent|ai:runtime|ai:role|ai:channel|ai:backfill/);
 });
 
+test("control panels keep hierarchy, status accents, and empty model fallback", () => {
+  const dir = mkdtempSync(join(tmpdir(), "horo-discord-panels-"));
+  try {
+    const store = new Store(join(dir, "bot.sqlite"));
+    const config = {
+      databasePath: join(dir, "bot.sqlite"),
+      aiBaseUrl: "http://9router:20128",
+      aiApiKey: "test-key",
+      aiModel: "",
+      aiSettingsUserIds: new Set(["manager"]),
+      aiSettingsRoleIds: new Set<string>()
+    } as never;
+    const interaction = {
+      guildId: "guild",
+      guild: { name: "HoRo" },
+      user: { id: "manager" },
+      member: null,
+      client: { ws: { ping: 12 } }
+    } as never;
+
+    const settings = settingsPanelMessage(interaction, store, config);
+    const settingsText = JSON.stringify(settings.components);
+    assert.match(settingsText, /## ⚙️ 設定/);
+    assert.match(settingsText, /✓ 總覽/);
+    assert.doesNotMatch(settingsText, /settings:refresh|\u200b/);
+    const settingsContainer = settings.components?.[0] as unknown as { accent_color: number } | undefined;
+    assert.equal(settingsContainer?.accent_color, 0x4e5058);
+
+    const admin = adminPanelMessage(interaction, store, config);
+    const adminText = JSON.stringify(admin.components);
+    assert.match(adminText, /HoRo/);
+    assert.match(adminText, /admin:refresh:status/);
+    assert.match(adminText, /admin:ai/);
+    assert.doesNotMatch(adminText, /admin:refresh:settings/);
+
+    const ai = aiSettingsPanelMessage(interaction, store, config);
+    const aiText = JSON.stringify(ai.components);
+    assert.match(aiText, /## 🤖 9router 設定/);
+    assert.match(aiText, /🟡 需設定/);
+    const aiContainer = ai.components?.[0] as unknown as { accent_color: number } | undefined;
+    assert.equal(aiContainer?.accent_color, 0xd29922);
+    store.db.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 test("removed AI panel interactions only request a fresh panel", async () => {
   const replies: Array<{ content?: string }> = [];
   const writes: string[] = [];
@@ -344,9 +390,9 @@ test("voice channel name rendering is Discord-safe enough", () => {
 test("voice settings labels and template normalization stay clear", () => {
   assert.equal(normalizeVoiceNameTemplate(""), "{user} 的頻道");
   assert.equal(normalizeVoiceNameTemplate(" {user}\nroom "), "{user} room");
-  assert.equal(voiceStatusLabel({ enabled: false, triggerChannelId: null, nameTemplate: "{user} 的語音", userLimit: 0, ownerManage: true }), "關閉");
-  assert.equal(voiceStatusLabel({ enabled: true, triggerChannelId: null, nameTemplate: "{user} 的語音", userLimit: 0, ownerManage: true }), "未完成設定");
-  assert.equal(voiceStatusLabel({ enabled: true, triggerChannelId: "trigger", nameTemplate: "{user} 的語音", userLimit: 0, ownerManage: true }), "可用");
+  assert.equal(voiceStatusLabel({ enabled: false, triggerChannelId: null, nameTemplate: "{user} 的語音", userLimit: 0, ownerManage: true }), "off");
+  assert.equal(voiceStatusLabel({ enabled: true, triggerChannelId: null, nameTemplate: "{user} 的語音", userLimit: 0, ownerManage: true }), "warn");
+  assert.equal(voiceStatusLabel({ enabled: true, triggerChannelId: "trigger", nameTemplate: "{user} 的語音", userLimit: 0, ownerManage: true }), "ready");
 });
 
 test("Steam free settings resolve defaults and labels", () => {
@@ -357,8 +403,8 @@ test("Steam free settings resolve defaults and labels", () => {
     notifyRoleIds: []
   });
   assert.deepEqual(resolveSteamFreeSettings({ notify_role_ids: " role1, role2 ,," }).notifyRoleIds, ["role1", "role2"]);
-  assert.equal(steamFreeStatusLabel(resolveSteamFreeSettings({ enabled: "true" })), "未完成設定");
-  assert.equal(steamFreeStatusLabel(resolveSteamFreeSettings({ enabled: "true", channel_id: " channel " })), "可用");
+  assert.equal(steamFreeStatusLabel(resolveSteamFreeSettings({ enabled: "true" })), "warn");
+  assert.equal(steamFreeStatusLabel(resolveSteamFreeSettings({ enabled: "true", channel_id: " channel " })), "ready");
 });
 test("AI access requires channel, then role or AI settings user", () => {
   const allowedChannelIds = new Set(["channel"]);
@@ -923,5 +969,5 @@ test("semantic memory search ranks embeddings only in the exact current channel"
 
 test("splitDiscordText adds chunk labels only when needed", () => {
   assert.deepEqual(splitDiscordText("short", 20), ["short"]);
-  assert.deepEqual(splitDiscordText("x".repeat(25), 20), ["[1/3]\nxxxxxxxxxx", "[2/3]\nxxxxxxxxxx", "[3/3]\nxxxxx"]);
+  assert.deepEqual(splitDiscordText("x".repeat(25), 20), ["xxxxxxxxxx\n\n-# 第 1 / 3 段", "xxxxxxxxxx\n\n-# 第 2 / 3 段", "xxxxx\n\n-# 第 3 / 3 段"]);
 });

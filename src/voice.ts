@@ -11,6 +11,7 @@ import {
   settingNumber,
   type EnvLike
 } from "./config.js";
+import type { StatusKind } from "./discord-ui.js";
 
 const DEFAULT_VOICE_NAME_TEMPLATE = "{user} 的頻道";
 // ponytail: the bot is single-process, so an in-memory lock is the complete coordination boundary.
@@ -38,9 +39,9 @@ export function normalizeVoiceNameTemplate(value: string | undefined): string {
   return (value?.replace(/[\r\n]/g, " ").replace(/\s+/g, " ").trim() || DEFAULT_VOICE_NAME_TEMPLATE).slice(0, 100);
 }
 
-export function voiceStatusLabel(settings: VoiceSettings): string {
-  if (!settings.enabled) return "關閉";
-  return settings.triggerChannelId ? "可用" : "未完成設定";
+export function voiceStatusLabel(settings: VoiceSettings): StatusKind {
+  if (!settings.enabled) return "off";
+  return settings.triggerChannelId ? "ready" : "warn";
 }
 
 export function renderVoiceChannelName(template: string, displayName: string): string {

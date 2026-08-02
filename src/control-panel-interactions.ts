@@ -35,7 +35,7 @@ import {
   sendSteamFreeTestMessage
 } from "./steam-free-runtime.js";
 import type { Store } from "./store.js";
-import { safeMentions } from "./text.js";
+import { DISCORD_ERROR_TEXT, safeMentions } from "./text.js";
 import { normalizeVoiceNameTemplate } from "./voice.js";
 import { readNineRouterKeyState } from "./nine-router-keys.js";
 type PanelInteraction = {
@@ -90,7 +90,7 @@ async function resetControlPanelDeleteTimer(interaction: PanelInteraction): Prom
 async function handleChatInput(interaction: ChatInputCommandInteraction, store: Store, config: Config): Promise<void> {
   if (interaction.commandName === "settings") {
     if (!canUseSettingsInteraction(interaction, store)) {
-      await interaction.reply({ content: "你沒有使用 /settings 的權限。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.reply(settingsPanelMessage(interaction, store, config));
@@ -100,7 +100,7 @@ async function handleChatInput(interaction: ChatInputCommandInteraction, store: 
 
   if (interaction.commandName === "admin") {
     if (!isManager(interaction, config.adminUserIds, config.adminRoleIds)) {
-      await interaction.reply({ content: "你沒有使用 /admin 的權限。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/admin"), flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.reply(adminPanelMessage(interaction, store, config));
@@ -110,7 +110,7 @@ async function handleChatInput(interaction: ChatInputCommandInteraction, store: 
 
   if (interaction.commandName !== "ai-settings") return;
   if (!isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
-    await interaction.reply({ content: "你沒有使用 /ai-settings 的權限。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
     return;
   }
   await interaction.reply(aiSettingsPanelMessage(interaction, store, config));
@@ -130,7 +130,7 @@ async function respondPanel(interaction: ModalSubmitInteraction, message: PanelM
 async function refreshProviderModelOptions(interaction: ProviderModelRefreshInteraction, store: Store, config: Config, page = 0): Promise<void> {
   const baseUrl = config.aiBaseUrl;
   const apiKey = config.aiApiKey;
-  const model = store.setting("ai_model") ?? config.aiModel;
+  const model = store.setting("ai_model") || config.aiModel;
   const keyState = readNineRouterKeyState(config.databasePath);
   const selectedKeyId = store.setting("ai_9router_key_id") ?? "";
   if (!baseUrl || !apiKey) {
@@ -174,11 +174,10 @@ async function handleVoiceSettingsModal(interaction: ModalSubmitInteraction, sto
   const userLimit = parseIntegerInput(interaction.fields.getTextInputValue("voice-user-limit"), 0, 99);
   const ownerManage = parseBooleanInput(interaction.fields.getTextInputValue("voice-owner-manage"));
   if (userLimit === null || ownerManage === null) {
-    await respondPanel(
-      interaction,
-      settingsPanelMessage(interaction, store, config, "voice"),
-      settingsPanelUpdate(interaction, store, config, "voice")
-    );
+    await interaction.reply({
+      content: DISCORD_ERROR_TEXT.invalidVoiceSettings,
+      flags: MessageFlags.Ephemeral
+    });
     return;
   }
   const nextUserLimit = userLimit ?? 0;
@@ -198,15 +197,15 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
   if (!customId.startsWith("ai:") && !customId.startsWith("admin:") && !customId.startsWith("settings:")) return false;
 
   if (customId.startsWith("admin:") && !isManager(interaction, config.adminUserIds, config.adminRoleIds)) {
-    await interaction.reply({ content: "你沒有使用 /admin 的權限。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/admin"), flags: MessageFlags.Ephemeral });
     return true;
   }
   if (customId.startsWith("ai:") && !isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
-    await interaction.reply({ content: "你沒有使用 /ai-settings 的權限。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
     return true;
   }
   if (customId.startsWith("settings:") && !canUseSettingsInteraction(interaction, store)) {
-    await interaction.reply({ content: "你沒有使用 /settings 的權限。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
     return true;
   }
 
@@ -214,18 +213,7 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
 
   const actor = { id: interaction.user.id, name: interaction.user.username };
   if (interaction.isButton()) {
-    if (customId === "settings:refresh" || customId === "settings:refresh:overview") {
-      await interaction.update(settingsPanelUpdate(interaction, store, config));
-      return true;
-    }
-    if (customId === "settings:refresh:voice") {
-      await interaction.update(settingsPanelUpdate(interaction, store, config, "voice"));
-      return true;
-    }
-    if (customId === "settings:refresh:steam-free") {
-      await interaction.update(settingsPanelUpdate(interaction, store, config, "steam-free"));
-      return true;
-    }
+
     if (customId === "settings:voice:toggle") {
       store.setVoiceSetting("enabled", String(!store.voiceSettings().enabled), actor);
       await interaction.update(settingsPanelUpdate(interaction, store, config, "voice"));
@@ -264,17 +252,14 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
       await interaction.update(adminPanelUpdate(interaction, store, config, "status"));
       return true;
     }
-    if (customId === "admin:refresh:settings") {
-      await interaction.update(adminPanelUpdate(interaction, store, config, "settings"));
-      return true;
-    }
+
     if (customId === "admin:settings") {
       await interaction.update(adminPanelUpdate(interaction, store, config, "settings"));
       return true;
     }
     if (customId === "admin:ai") {
       if (!isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
-        await interaction.reply({ content: "你沒有使用 /ai-settings 的權限。", flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
         return true;
       }
       await interaction.update(aiSettingsPanelUpdate(interaction, store, config));
@@ -295,11 +280,10 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
         ].join("\n"), true));
       } catch (error) {
         const normalized = aiError(error);
-        await interaction.editReply(aiTestResultPanelUpdate([
-          "AI 測試失敗。",
-          `錯誤代碼：${normalized.userCode}`,
-          `類型：${normalized.logType}`
-        ].join("\n"), false));
+        await interaction.editReply(aiTestResultPanelUpdate(
+          DISCORD_ERROR_TEXT.aiUnavailable(normalized.userCode),
+          false
+        ));
       }
       return true;
     }
@@ -364,7 +348,7 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
   }
   if (interaction.isStringSelectMenu() && customId === "ai:model:select") {
     const selected = interaction.values[0]?.trim();
-    const currentModel = store.setting("ai_model") ?? config.aiModel;
+    const currentModel = store.setting("ai_model") || config.aiModel;
     await interaction.update(aiModelLoadingPanelUpdate(currentModel));
     try {
       const options = await fetchAiModelOptions(config);
@@ -373,7 +357,7 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
       }
       const keyState = readNineRouterKeyState(config.databasePath);
       await interaction.editReply(aiModelSelectPanelUpdate(
-        store.setting("ai_model") ?? config.aiModel,
+        store.setting("ai_model") || config.aiModel,
         options,
         0,
         keyState,
@@ -409,7 +393,7 @@ export async function handleInteraction(interaction: Interaction, store: Store, 
   }
   if (interaction.isModalSubmit() && interaction.customId === "settings:voice-modal") {
     if (!canUseSettingsInteraction(interaction, store)) {
-      await interaction.reply({ content: "你沒有使用 /settings 的權限。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
       return;
     }
     await handleVoiceSettingsModal(interaction, store, config);
@@ -417,7 +401,7 @@ export async function handleInteraction(interaction: Interaction, store: Store, 
   }
   if (interaction.isModalSubmit() && interaction.customId.startsWith("ai:")) {
     if (!isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
-      await interaction.reply({ content: "你沒有使用 /ai-settings 的權限。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.reply({ content: "此 AI 設定面板已簡化，請重新執行 /ai-settings。", flags: MessageFlags.Ephemeral });

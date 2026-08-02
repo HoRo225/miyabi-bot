@@ -325,14 +325,13 @@ function steamFreeNotificationComponents(item: SteamFreeItem, notifyRoleIds: str
   const notifyMentions = notifyRoleIds.map((id) => `<@&${id}>`).join(" ");
   const infoLines = [
     "### 領取資訊",
-    steamFreeDiscountLine(item),
-    steamFreePriceLine(item),
     steamFreeClaimUntilLine(item),
+    steamFreePriceLine(item),
     steamFreeReviewLine(item)
   ].filter((line): line is string => Boolean(line));
   const children: ComponentJson[] = [
     textDisplay([
-      "# ꜱᴛᴇᴀᴍ免費遊戲領取",
+      "# Steam 免費遊戲領取",
       notifyMentions,
       `## ${steamFreeNotificationTitle(item)}`
     ].filter(Boolean).join("\n")),
@@ -343,28 +342,22 @@ function steamFreeNotificationComponents(item: SteamFreeItem, notifyRoleIds: str
   children.push(
     separator(),
     actionRow([linkButton(item.url, "前往領取")]),
-    separator(),
-    textDisplay("資料來源：Steam Store")
+    textDisplay("-# 資料來源：Steam Store")
   );
-  return [componentContainer(children, 2450411)];
+  return [componentContainer(children, steamFreeItemExpired(item) ? "off" : "ready")];
 }
 
-function steamFreeDiscountLine(item: SteamFreeItem): string {
-  return `折扣：${inlineCodeText(item.discountText ?? "-100%")}`;
-}
 
 function steamFreePriceLine(item: SteamFreeItem): string {
-  return `價格：${inlineCodeText(steamFreePriceText(item))}`;
+  return "💰 " + inlineCodeText(steamFreePriceText(item)) + "（" + (item.discountText ?? "-100%") + "）";
 }
-
 function steamFreeClaimUntilLine(item: SteamFreeItem): string {
-  return `領取截止：${discordTimestampText(item.claimUntilAt, inlineCodeText("Steam 未提供"))}`;
+  return "⏰ 截止 · " + discordTimestampText(item.claimUntilAt, inlineCodeText("Steam 未提供"));
 }
-
 function steamFreeReviewLine(item: SteamFreeItem): string | null {
   if (!item.reviewSummary) return null;
-  const percent = item.reviewPercent == null ? "" : `（${item.reviewPercent}%）`;
-  return `整體評價：${inlineCodeText(`${safeMentions(item.reviewSummary)}${percent}`)}`;
+  const percent = item.reviewPercent == null ? "" : "（" + item.reviewPercent + "%）";
+  return "👍 " + inlineCodeText(safeMentions(item.reviewSummary) + percent);
 }
 
 
