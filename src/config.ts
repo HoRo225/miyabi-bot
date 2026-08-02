@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 
 const DEFAULT_AI_BASE_URL = "http://9router:20128";
-const DEFAULT_AI_EMBEDDING_MODEL = "gemini/gemini-embedding-2-preview";
+const DEFAULT_AI_MODEL = "gemini/gemini-3.6-flash";
 
 export type Config = {
   token: string;
@@ -15,19 +15,10 @@ export type Config = {
   aiBaseUrl: string;
   aiApiKey: string;
   aiModel: string;
-  aiEmbeddingModel: string;
-  summaryMessageLimit: number;
   replyMentionUser: boolean;
-  attachmentMaxBytes: number;
 };
 
 export type EnvLike = Record<string, string | undefined>;
-
-export type RuntimeSettings = {
-  summaryMessageLimit: number;
-  replyMentionUser: boolean;
-  attachmentMaxBytes: number;
-};
 
 export function parseIds(value = ""): Set<string> {
   return new Set(value.split(",").map((id) => id.trim()).filter(Boolean));
@@ -39,11 +30,6 @@ function envFlag(key: string, defaultValue: boolean): boolean {
   return !["0", "false", "no"].includes(value.toLowerCase());
 }
 
-function envNumber(key: string, defaultValue: number): number {
-  const value = Number(process.env[key]);
-  return Number.isFinite(value) && value > 0 ? value : defaultValue;
-}
-
 function envText(env: EnvLike, key: string): string | undefined {
   const value = env[key]?.trim();
   return value ? value : undefined;
@@ -53,7 +39,7 @@ export function resolveAiProviderConfig(env: EnvLike): { baseUrl: string; apiKey
   return {
     baseUrl: envText(env, "AI_BASE_URL") ?? DEFAULT_AI_BASE_URL,
     apiKey: envText(env, "AI_API_KEY") ?? "",
-    model: envText(env, "AI_MODEL") ?? ""
+    model: envText(env, "AI_MODEL") ?? DEFAULT_AI_MODEL
   };
 }
 
@@ -71,15 +57,6 @@ export function clampInteger(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.trunc(value)));
 }
 
-export function resolveRuntimeSettings(settings: EnvLike, defaults: RuntimeSettings): RuntimeSettings {
-  const attachmentMaxMb = settingNumber(settings.attachment_max_mb, defaults.attachmentMaxBytes / 1024 / 1024);
-  return {
-    summaryMessageLimit: clampInteger(settingNumber(settings.summary_message_limit, defaults.summaryMessageLimit), 1, 100),
-    replyMentionUser: settingBoolean(settings.reply_mention_user, defaults.replyMentionUser),
-    attachmentMaxBytes: clampInteger(attachmentMaxMb, 1, 100) * 1024 * 1024
-  };
-}
-
 export function loadConfig(): Config {
   const aiProvider = resolveAiProviderConfig(process.env);
   return {
@@ -94,10 +71,7 @@ export function loadConfig(): Config {
     aiBaseUrl: aiProvider.baseUrl,
     aiApiKey: aiProvider.apiKey,
     aiModel: aiProvider.model,
-    aiEmbeddingModel: envText(process.env, "AI_EMBEDDING_MODEL") ?? DEFAULT_AI_EMBEDDING_MODEL,
-    summaryMessageLimit: clampInteger(envNumber("DEFAULT_SUMMARY_MESSAGE_LIMIT", 50), 1, 100),
-    replyMentionUser: envFlag("REPLY_MENTION_USER", true),
-    attachmentMaxBytes: envNumber("ATTACHMENT_MAX_MB", 10) * 1024 * 1024
+    replyMentionUser: envFlag("REPLY_MENTION_USER", true)
   };
 }
 

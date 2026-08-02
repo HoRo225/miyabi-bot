@@ -41,10 +41,12 @@ import { nineRouterKeyOptions, readNineRouterKeyState, type NineRouterKeyState }
 import { voiceStatusLabel, type VoiceSettings } from "./voice.js";
 
 type AdminStats = {
-  messages: number;
-  attachments: number;
   aiRequestLogs: number;
+  aiResponseMessages: number;
   auditLogs: number;
+  allowedChannels: number;
+  allowedRoles: number;
+  settingsRoles: number;
 };
 
 type ControlPanelStore = {
@@ -231,7 +233,7 @@ function adminPanelComponents(interaction: Interaction, store: ControlPanelStore
   ];
 
   if (module === "status") {
-    let stats: AdminStats = { messages: 0, attachments: 0, aiRequestLogs: 0, auditLogs: 0 };
+    let stats: AdminStats = { aiRequestLogs: 0, aiResponseMessages: 0, auditLogs: 0, allowedChannels: 0, allowedRoles: 0, settingsRoles: 0 };
     let statsStatus: StatusKind = "ready";
     try {
       stats = store.adminStats();
@@ -253,8 +255,9 @@ function adminPanelComponents(interaction: Interaction, store: ControlPanelStore
         "資料庫 · " + statusBadge(databaseKind) + " · " + database.text,
         "",
         "### 資料量",
-        "訊息 " + stats.messages + " · 附件 " + stats.attachments,
-        "AI 請求 " + stats.aiRequestLogs + " · Audit " + stats.auditLogs,
+        "AI 請求 " + stats.aiRequestLogs + " · 回覆訊息 " + stats.aiResponseMessages,
+        "允許頻道 " + stats.allowedChannels + " · 允許角色 " + stats.allowedRoles + " · 設定角色 " + stats.settingsRoles,
+        "Audit " + stats.auditLogs,
         "",
         "### 功能",
         ...enabledModuleLines(store)

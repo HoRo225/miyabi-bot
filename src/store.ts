@@ -1,18 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { isLikelyImageAttachment } from "./guards.js";
-import {
-  boundedContextMessages,
-  cosineSimilarity,
-  ftsQueryFromText,
-  parseEmbeddingJson,
-  promptSource,
-  twoCharacterHanTerms,
-  uniquePromptRefs,
-  type MemorySearchResult,
-  type PromptMessageRef
-} from "./memory.js";
 import {
   type SteamFreeItem,
   type SteamFreeSettings
@@ -29,134 +17,8 @@ import {
 } from "./steam-free-store.js";
 export type { SteamFreeSeenItem } from "./steam-free-store.js";
 import { resolveVoiceSettings, type VoiceSettings } from "./voice.js";
-type StoredAttachment = {
-  attachmentId: string;
-  messageId: string;
-  filename: string | null;
-  contentType: string | null;
-  sizeBytes: number;
-  lastSeenUrl: string;
-  proxyUrl: string | null;
-};
-
-export type StoredMessage = {
-  messageId: string;
-  guildId: string;
-  channelId: string;
-  parentChannelId: string | null;
-  authorId: string;
-  authorName: string | null;
-  content: string | null;
-  createdAt: string;
-  editedAt: string | null;
-  editedFlag: boolean;
-  referencedMessageId: string | null;
-  messageUrl: string;
-  attachments: StoredAttachment[];
-};
-
-type BackfillJobStart = {
-  id: number;
-  targetCount: number;
-};
-
-export type BackfillTarget = {
-  id: number;
-  jobId: number;
-  channelId: string;
-  parentChannelId: string | null;
-  type: string;
-  oldestFetchedMessageId: string | null;
-  fetchedMessageCount: number;
-  retryCount: number;
-};
-
-export type BackfillStatus = {
-  job: {
-    id: number;
-    status: string;
-    scope: string;
-    updatedAt: string;
-    lastError: string | null;
-  };
-  counts: {
-    total: number;
-    completed: number;
-    running: number;
-    pending: number;
-    failed: number;
-    skipped: number;
-    fetched: number;
-  };
-  current?: {
-    channelId: string;
-    type: string;
-    fetchedMessageCount: number;
-    lastError: string | null;
-  };
-};
-
 const schema = `
 PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS messages (
-  message_id TEXT PRIMARY KEY,
-  guild_id TEXT NOT NULL,
-  channel_id TEXT NOT NULL,
-  parent_channel_id TEXT,
-  author_id TEXT NOT NULL,
-  author_name TEXT,
-  content TEXT,
-  created_at TEXT NOT NULL,
-  edited_at TEXT,
-  edited_flag INTEGER NOT NULL DEFAULT 0,
-  referenced_message_id TEXT,
-  message_url TEXT,
-  has_attachments INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
-  message_id UNINDEXED,
-  channel_id UNINDEXED,
-  author_name,
-  content,
-  tokenize = 'trigram'
-);
-
-CREATE TABLE IF NOT EXISTS message_embeddings (
-  message_id TEXT PRIMARY KEY,
-  model TEXT NOT NULL,
-  embedding_json TEXT,
-  dimension INTEGER,
-  status TEXT NOT NULL,
-  retry_count INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS attachments (
-  attachment_id TEXT PRIMARY KEY,
-  message_id TEXT NOT NULL,
-  filename TEXT,
-  content_type TEXT,
-  size_bytes INTEGER,
-  last_seen_url TEXT,
-  proxy_url TEXT,
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS attachment_extractions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  attachment_id TEXT NOT NULL,
-  message_id TEXT NOT NULL,
-  filename TEXT,
-  content_type TEXT,
-  size_bytes INTEGER,
-  extracted_text TEXT,
-  extraction_method TEXT,
-  extracted_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS ai_allowed_roles (
   role_id TEXT PRIMARY KEY,
@@ -166,9 +28,6 @@ CREATE TABLE IF NOT EXISTS ai_allowed_roles (
 
 CREATE TABLE IF NOT EXISTS ai_channel_whitelist (
   channel_id TEXT PRIMARY KEY,
-  include_threads INTEGER NOT NULL DEFAULT 1,
-  memory_enabled INTEGER NOT NULL DEFAULT 0,
-  backfill_enabled INTEGER NOT NULL DEFAULT 1,
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -243,33 +102,14 @@ CREATE TABLE IF NOT EXISTS ai_request_logs (
 
 CREATE INDEX IF NOT EXISTS ai_request_logs_created_at_idx ON ai_request_logs(created_at);
 
-CREATE TABLE IF NOT EXISTS backfill_jobs (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  status TEXT NOT NULL,
-  scope TEXT NOT NULL,
-  started_by TEXT NOT NULL,
-  started_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL,
-  completed_at TEXT,
-  retry_count INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT
+CREATE TABLE IF NOT EXISTS ai_response_messages (
+  request_log_id INTEGER NOT NULL REFERENCES ai_request_logs(id) ON DELETE CASCADE,
+  message_id TEXT PRIMARY KEY,
+  segment_index INTEGER NOT NULL,
+  created_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS backfill_targets (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  job_id INTEGER NOT NULL,
-  channel_id TEXT NOT NULL,
-  parent_channel_id TEXT,
-  type TEXT NOT NULL,
-  status TEXT NOT NULL,
-  oldest_fetched_message_id TEXT,
-  fetched_message_count INTEGER NOT NULL DEFAULT 0,
-  retry_count INTEGER NOT NULL DEFAULT 0,
-  last_error TEXT,
-  started_at TEXT,
-  updated_at TEXT NOT NULL,
-  completed_at TEXT
-);
+CREATE INDEX IF NOT EXISTS ai_response_messages_request_idx ON ai_response_messages(request_log_id, segment_index);
 
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -286,77 +126,260 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 `;
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const RUNTIME_SETTING_KEYS = new Set([
   "ai_enabled",
   "ai_9router_key_id",
   "ai_model",
   "attachment_max_mb",
-  "reply_mention_user",
-  "summary_message_limit"
+  "ai_cooldown_seconds",
+  "ai_max_in_flight",
+  "ai_queue_max",
+  "ai_queue_timeout_seconds",
+  "ai_recent_context_limit",
+  "ai_response_max_chars",
+  "reply_mention_user"
 ]);
 const SELECTOR_LIMIT = 25;
+const RESPONSE_MESSAGE_COLUMNS = ["request_log_id", "message_id", "segment_index", "created_at"];
+const ROLE_COLUMNS = ["role_id", "created_by", "created_at"];
+const RUNTIME_SETTING_COLUMNS = ["key", "value", "updated_by", "updated_at"];
+const STEAM_SEEN_COLUMNS = [
+  "app_id", "name", "url", "original_price", "final_price", "review_summary", "review_percent",
+  "capsule_url", "claim_until_at", "message_id", "expired_at", "first_seen_at", "notified_at"
+];
+
 
 function migrateSchema(db: DatabaseSync): void {
-  const embeddingColumns = new Set((db.prepare("PRAGMA table_info(message_embeddings)").all() as Array<{ name: string }>).map((column) => column.name));
-  const pendingColumns = [
-    ["pending_model", "TEXT"],
-    ["pending_retry_count", "INTEGER NOT NULL DEFAULT 0"],
-    ["pending_error", "TEXT"],
-    ["pending_updated_at", "TEXT"]
-  ] as const;
-  const missingPendingColumns = pendingColumns.filter(([name]) => !embeddingColumns.has(name));
-  const ftsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'message_fts'").get() as { sql?: string } | undefined)?.sql ?? "";
+  const currentVersion = Number((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+  const removedTables = [
+    "messages",
+    "message_fts",
+    "message_fts_data",
+    "message_fts_idx",
+    "message_fts_content",
+    "message_fts_docsize",
+    "message_fts_config",
+    "message_embeddings",
+    "attachments",
+    "attachment_extractions",
+    "backfill_jobs",
+    "backfill_targets",
+    "url_fetch_logs",
+    "deleted_messages",
+    "agent_pending_actions"
+  ];
+  const hasRemovedTables = removedTables.some((table) => tableExists(db, table));
+  const channelColumns = tableColumns(db, "ai_channel_whitelist");
+  const expectedChannelColumns = ["channel_id", "created_by", "created_at"];
+  const needsChannelRebuild = channelColumns.length > 0 && channelColumns.join("\0") !== expectedChannelColumns.join("\0");
+  const needsAllowedRolesRebuild = !tableColumnsMatch(db, "ai_allowed_roles", ROLE_COLUMNS);
+  const needsSettingsRolesRebuild = !tableColumnsMatch(db, "settings_allowed_roles", ROLE_COLUMNS);
+  const needsVoiceSettingsRebuild = !tableColumnsMatch(db, "voice_runtime_settings", RUNTIME_SETTING_COLUMNS);
+  const needsSteamSettingsRebuild = !tableColumnsMatch(db, "steam_free_runtime_settings", RUNTIME_SETTING_COLUMNS);
+  const needsAiSettingsRebuild = !tableColumnsMatch(db, "ai_runtime_settings", RUNTIME_SETTING_COLUMNS);
+  const needsSteamSeenRebuild = !tableColumnsMatch(db, "steam_free_seen_items", STEAM_SEEN_COLUMNS);
+  const needsRetainedTableRebuild = needsAllowedRolesRebuild || needsSettingsRolesRebuild ||
+    needsVoiceSettingsRebuild || needsSteamSettingsRebuild || needsAiSettingsRebuild || needsSteamSeenRebuild;
 
-  db.exec("BEGIN");
+  const responseColumns = tableColumns(db, "ai_response_messages");
+  const needsResponseRebuild = responseColumns.length > 0 && !responseMessageSchemaValid(db);
+
+  const needsMigration = currentVersion < SCHEMA_VERSION || hasRemovedTables || needsChannelRebuild ||
+    needsResponseRebuild || needsRetainedTableRebuild;
+  if (!needsMigration) {
+    assertDatabaseHealthy(db);
+    return;
+  }
+
+  db.exec("BEGIN IMMEDIATE");
   try {
-    for (const [name, definition] of missingPendingColumns) {
-      db.exec(`ALTER TABLE message_embeddings ADD COLUMN ${name} ${definition}`);
-    }
-    if (missingPendingColumns.length) {
+    if (needsAllowedRolesRebuild) rebuildRoleTable(db, "ai_allowed_roles");
+    if (needsSettingsRolesRebuild) rebuildRoleTable(db, "settings_allowed_roles");
+    if (needsVoiceSettingsRebuild) rebuildRuntimeSettingsTable(db, "voice_runtime_settings");
+    if (needsSteamSettingsRebuild) rebuildRuntimeSettingsTable(db, "steam_free_runtime_settings");
+    if (needsAiSettingsRebuild) rebuildRuntimeSettingsTable(db, "ai_runtime_settings");
+    if (needsSteamSeenRebuild) rebuildSteamSeenTable(db);
+
+    if (needsChannelRebuild) {
+      db.exec("DROP TABLE IF EXISTS ai_channel_whitelist_v5");
       db.exec(`
-        UPDATE message_embeddings
-        SET pending_model = CASE WHEN status = 'completed' THEN NULL ELSE model END,
-            pending_retry_count = CASE WHEN status = 'completed' THEN 0 ELSE retry_count END,
-            pending_error = CASE WHEN status = 'completed' THEN NULL ELSE last_error END,
-            pending_updated_at = CASE WHEN status = 'completed' THEN NULL ELSE updated_at END
-      `);
-    }
-    if (!/tokenize\s*=\s*['"]?trigram/i.test(ftsSql)) {
-      db.exec("DROP TABLE message_fts");
-      db.exec(`
-        CREATE VIRTUAL TABLE message_fts USING fts5(
-          message_id UNINDEXED,
-          channel_id UNINDEXED,
-          author_name,
-          content,
-          tokenize = 'trigram'
+        CREATE TABLE ai_channel_whitelist_v5 (
+          channel_id TEXT PRIMARY KEY,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL
         )
       `);
       db.exec(`
-        INSERT INTO message_fts (message_id, channel_id, author_name, content)
-        SELECT m.message_id,
-               m.channel_id,
-               m.author_name,
-               trim(coalesce(m.content, '') || CASE WHEN e.content IS NULL THEN '' ELSE char(10) || e.content END)
-        FROM messages m
-        LEFT JOIN (
-          SELECT message_id, group_concat(extracted_text, char(10)) AS content
-          FROM attachment_extractions
-          GROUP BY message_id
-        ) e ON e.message_id = m.message_id
+        INSERT OR IGNORE INTO ai_channel_whitelist_v5 (channel_id, created_by, created_at)
+        SELECT channel_id, created_by, created_at
+        FROM ai_channel_whitelist
+        ORDER BY created_at
+      `);
+      db.exec("DROP TABLE ai_channel_whitelist");
+      db.exec("ALTER TABLE ai_channel_whitelist_v5 RENAME TO ai_channel_whitelist");
+    }
+    if (needsResponseRebuild) {
+      const canCopyResponses = RESPONSE_MESSAGE_COLUMNS.every((column) => responseColumns.includes(column));
+      db.exec("DROP TABLE IF EXISTS ai_response_messages_v5");
+      db.exec(`
+        CREATE TABLE ai_response_messages_v5 (
+          request_log_id INTEGER NOT NULL REFERENCES ai_request_logs(id) ON DELETE CASCADE,
+          message_id TEXT PRIMARY KEY,
+          segment_index INTEGER NOT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      if (canCopyResponses) {
+        db.exec(`
+          INSERT OR IGNORE INTO ai_response_messages_v5
+            (request_log_id, message_id, segment_index, created_at)
+          SELECT response.request_log_id, response.message_id, response.segment_index, response.created_at
+          FROM ai_response_messages response
+          JOIN ai_request_logs logs ON logs.id = response.request_log_id
+        `);
+      }
+      db.exec("DROP TABLE ai_response_messages");
+      db.exec("ALTER TABLE ai_response_messages_v5 RENAME TO ai_response_messages");
+      db.exec(`
+        CREATE INDEX ai_response_messages_request_idx
+        ON ai_response_messages(request_log_id, segment_index)
       `);
     }
-    db.exec("DROP TABLE IF EXISTS url_fetch_logs");
-    db.exec("DROP TABLE IF EXISTS deleted_messages");
-    db.exec("DROP TABLE IF EXISTS agent_pending_actions");
+
+    for (const table of removedTables) db.exec(`DROP TABLE IF EXISTS ${table}`);
     db.prepare("DELETE FROM ai_runtime_settings WHERE key IN ('ai_base_url', 'ai_api_key', 'ai_embedding_model', 'ai_agent_enabled', 'ai_agent_probe_model')").run();
+    db.prepare(`
+      INSERT INTO ai_runtime_settings (key, value, updated_by, updated_at)
+      VALUES ('ai_enabled', 'false', NULL, ?)
+      ON CONFLICT(key) DO UPDATE SET value = 'false', updated_by = NULL, updated_at = excluded.updated_at
+    `).run(now());
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.exec("COMMIT");
   } catch (error) {
-    db.exec("ROLLBACK");
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // Preserve the original insert error.
+    }
     throw error;
   }
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.exec("VACUUM");
+  assertDatabaseHealthy(db);
+}
+
+function tableExists(db: DatabaseSync, table: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table', 'virtual table') AND name = ?").get(table));
+}
+
+function tableColumns(db: DatabaseSync, table: string): string[] {
+  if (!tableExists(db, table)) return [];
+  return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((column) => column.name);
+}
+function tableColumnsMatch(db: DatabaseSync, table: string, expected: readonly string[]): boolean {
+  return tableColumns(db, table).join("\0") === expected.join("\0");
+}
+
+function rebuildRoleTable(db: DatabaseSync, table: "ai_allowed_roles" | "settings_allowed_roles"): void {
+  const replacement = `${table}_v5`;
+  db.exec(`DROP TABLE IF EXISTS ${replacement}`);
+  db.exec(`
+    CREATE TABLE ${replacement} (
+      role_id TEXT PRIMARY KEY,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    INSERT OR IGNORE INTO ${replacement} (role_id, created_by, created_at)
+    SELECT role_id, created_by, created_at
+    FROM ${table}
+    ORDER BY created_at
+  `);
+  db.exec(`DROP TABLE ${table}`);
+  db.exec(`ALTER TABLE ${replacement} RENAME TO ${table}`);
+}
+
+function rebuildRuntimeSettingsTable(
+  db: DatabaseSync,
+  table: "voice_runtime_settings" | "steam_free_runtime_settings" | "ai_runtime_settings"
+): void {
+  const replacement = `${table}_v5`;
+  db.exec(`DROP TABLE IF EXISTS ${replacement}`);
+  db.exec(`
+    CREATE TABLE ${replacement} (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_by TEXT,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    INSERT OR REPLACE INTO ${replacement} (key, value, updated_by, updated_at)
+    SELECT key, value, updated_by, updated_at
+    FROM ${table}
+    ORDER BY updated_at
+  `);
+  db.exec(`DROP TABLE ${table}`);
+  db.exec(`ALTER TABLE ${replacement} RENAME TO ${table}`);
+}
+
+function rebuildSteamSeenTable(db: DatabaseSync): void {
+  db.exec("DROP TABLE IF EXISTS steam_free_seen_items_v5");
+  db.exec(`
+    CREATE TABLE steam_free_seen_items_v5 (
+      app_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      original_price TEXT,
+      final_price TEXT,
+      review_summary TEXT,
+      review_percent INTEGER,
+      capsule_url TEXT,
+      claim_until_at TEXT,
+      message_id TEXT,
+      expired_at TEXT,
+      first_seen_at TEXT NOT NULL,
+      notified_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    INSERT OR REPLACE INTO steam_free_seen_items_v5
+      (app_id, name, url, original_price, final_price, review_summary, review_percent, capsule_url,
+       claim_until_at, message_id, expired_at, first_seen_at, notified_at)
+    SELECT app_id, name, url, original_price, final_price, review_summary, review_percent, capsule_url,
+           claim_until_at, message_id, expired_at, first_seen_at, notified_at
+    FROM steam_free_seen_items
+    ORDER BY notified_at
+  `);
+  db.exec("DROP TABLE steam_free_seen_items");
+  db.exec("ALTER TABLE steam_free_seen_items_v5 RENAME TO steam_free_seen_items");
+}
+
+function responseMessageSchemaValid(db: DatabaseSync): boolean {
+  const columns = tableColumns(db, "ai_response_messages");
+  if (columns.join("\0") !== RESPONSE_MESSAGE_COLUMNS.join("\0")) return false;
+  const foreignKeys = db.prepare("PRAGMA foreign_key_list(ai_response_messages)").all() as Array<{
+    table: string;
+    from: string;
+    to: string;
+    on_delete: string;
+  }>;
+  return foreignKeys.some((foreignKey) =>
+    foreignKey.table === "ai_request_logs" &&
+    foreignKey.from === "request_log_id" &&
+    foreignKey.to === "id" &&
+    foreignKey.on_delete.toUpperCase() === "CASCADE"
+  );
+}
+
+
+function assertDatabaseHealthy(db: DatabaseSync): void {
+  const integrity = (db.prepare("PRAGMA integrity_check").get() as { integrity_check: string }).integrity_check;
+  if (integrity !== "ok") throw new Error(`sqlite_integrity_check_failed:${integrity}`);
+  const foreignKeys = db.prepare("PRAGMA foreign_key_check").all();
+  if (foreignKeys.length) throw new Error(`sqlite_foreign_key_check_failed:${foreignKeys.length}`);
 }
 
 export class Store {
@@ -367,8 +390,8 @@ export class Store {
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec(schema);
-    migrateSchema(this.db);
     ensureSteamFreeSeenItemColumns(this.db);
+    migrateSchema(this.db);
     this.pruneAiRequestLogs();
   }
 
@@ -380,31 +403,21 @@ export class Store {
     return this.db.prepare("SELECT channel_id FROM ai_channel_whitelist ORDER BY channel_id").all().map((row) => String((row as { channel_id: unknown }).channel_id));
   }
 
-  listMemoryChannels(): string[] {
-    return this.db.prepare("SELECT channel_id FROM ai_channel_whitelist WHERE memory_enabled = 1 ORDER BY channel_id").all().map((row) => String((row as { channel_id: unknown }).channel_id));
-  }
-
-  listBackfillChannels(): string[] {
-    return this.db.prepare("SELECT channel_id FROM ai_channel_whitelist WHERE backfill_enabled = 1 AND memory_enabled = 1 ORDER BY channel_id").all().map((row) => String((row as { channel_id: unknown }).channel_id));
-  }
-
   listSettingsAllowedRoles(): string[] {
     return this.db.prepare("SELECT role_id FROM settings_allowed_roles ORDER BY role_id").all().map((row) => String((row as { role_id: unknown }).role_id));
   }
 
   adminStats(): {
-    messages: number;
-    attachments: number;
     aiRequestLogs: number;
+    aiResponseMessages: number;
     auditLogs: number;
     allowedChannels: number;
     allowedRoles: number;
     settingsRoles: number;
   } {
     return {
-      messages: this.tableCount("messages"),
-      attachments: this.tableCount("attachments"),
       aiRequestLogs: this.tableCount("ai_request_logs"),
+      aiResponseMessages: this.tableCount("ai_response_messages"),
       auditLogs: this.tableCount("audit_logs"),
       allowedChannels: this.listAllowedChannels().length,
       allowedRoles: this.listAllowedRoles().length,
@@ -414,259 +427,6 @@ export class Store {
 
   tableCount(table: string): number {
     return Number((this.db.prepare(`SELECT count(*) AS count FROM ${table}`).get() as { count: unknown }).count);
-  }
-
-  activeBackfillJob(): { id: number; status: string } | undefined {
-    return this.db.prepare("SELECT id, status FROM backfill_jobs WHERE status IN ('queued', 'running') ORDER BY id DESC LIMIT 1").get() as { id: number; status: string } | undefined;
-  }
-
-  activeBackfillJobIds(): number[] {
-    return this.db.prepare("SELECT id FROM backfill_jobs WHERE status IN ('queued', 'running') ORDER BY id").all().map((row) => Number((row as { id: unknown }).id));
-  }
-
-  startBackfillJob(actor: UserRef): BackfillJobStart {
-    const timestamp = now();
-    this.db.exec("BEGIN");
-    try {
-      const result = this.db.prepare(`
-        INSERT INTO backfill_jobs (status, scope, started_by, started_at, updated_at)
-        VALUES ('queued', 'full', ?, ?, ?)
-      `).run(actor.id, timestamp, timestamp);
-      const jobId = Number(result.lastInsertRowid);
-      let targetCount = 0;
-      for (const channelId of this.listBackfillChannels()) {
-        if (this.addBackfillTarget(jobId, channelId, null, "channel")) targetCount += 1;
-      }
-      this.audit(actor, "ai-settings", "start_backfill", "backfill_job", String(jobId), null, String(targetCount), "ok");
-      this.db.exec("COMMIT");
-      return { id: jobId, targetCount };
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  addBackfillTarget(jobId: number, channelId: string, parentChannelId: string | null, type: string): boolean {
-    const exists = this.db.prepare("SELECT 1 FROM backfill_targets WHERE job_id = ? AND channel_id = ?").get(jobId, channelId);
-    if (exists) return false;
-    const timestamp = now();
-    return this.db.prepare(`
-      INSERT INTO backfill_targets
-        (job_id, channel_id, parent_channel_id, type, status, updated_at)
-      VALUES (?, ?, ?, ?, 'pending', ?)
-    `).run(jobId, channelId, parentChannelId, type, timestamp).changes > 0;
-  }
-
-  resetRunningBackfillTargets(jobId: number): void {
-    this.db.prepare("UPDATE backfill_targets SET status = 'pending', updated_at = ? WHERE job_id = ? AND status = 'running'").run(now(), jobId);
-  }
-
-  markBackfillJobRunning(jobId: number): void {
-    this.db.prepare("UPDATE backfill_jobs SET status = 'running', updated_at = ?, last_error = NULL WHERE id = ?").run(now(), jobId);
-  }
-
-  backfillFetchedCount(jobId: number): number {
-    return Number((this.db.prepare("SELECT coalesce(sum(fetched_message_count), 0) AS count FROM backfill_targets WHERE job_id = ?").get(jobId) as { count: unknown }).count);
-  }
-
-  finishBackfillJob(jobId: number, forcedStatus?: "partial_limit"): void {
-    if (forcedStatus === "partial_limit") {
-      this.db.prepare("UPDATE backfill_targets SET status = 'skipped', updated_at = ?, completed_at = ? WHERE job_id = ? AND status = 'pending'").run(now(), now(), jobId);
-    }
-    const failedCount = (this.db.prepare("SELECT count(*) AS count FROM backfill_targets WHERE job_id = ? AND status = 'failed'").get(jobId) as { count: number }).count;
-    const status = forcedStatus ?? (failedCount ? "failed" : "completed");
-    const lastError = forcedStatus === "partial_limit" ? "message limit reached" : failedCount ? `${failedCount} targets failed` : null;
-    this.db.prepare("UPDATE backfill_jobs SET status = ?, updated_at = ?, completed_at = ?, last_error = ? WHERE id = ?").run(
-      status,
-      now(),
-      now(),
-      lastError,
-      jobId
-    );
-    const job = this.db.prepare("SELECT started_by FROM backfill_jobs WHERE id = ?").get(jobId) as { started_by: string } | undefined;
-    if (job) {
-      this.audit({ id: job.started_by, name: null }, "ai-settings", status === "failed" ? "backfill_failed" : status === "partial_limit" ? "backfill_partial_limit" : "backfill_completed", "backfill_job", String(jobId), null, null, status);
-    }
-  }
-
-  nextBackfillTarget(jobId: number): BackfillTarget | undefined {
-    const row = this.db.prepare(`
-      SELECT id, job_id, channel_id, parent_channel_id, type, oldest_fetched_message_id, fetched_message_count, retry_count
-      FROM backfill_targets
-      WHERE job_id = ? AND status = 'pending'
-      ORDER BY id
-      LIMIT 1
-    `).get(jobId) as {
-      id: number;
-      job_id: number;
-      channel_id: string;
-      parent_channel_id: string | null;
-      type: string;
-      oldest_fetched_message_id: string | null;
-      fetched_message_count: number;
-      retry_count: number;
-    } | undefined;
-    if (!row) return undefined;
-    return {
-      id: row.id,
-      jobId: row.job_id,
-      channelId: row.channel_id,
-      parentChannelId: row.parent_channel_id,
-      type: row.type,
-      oldestFetchedMessageId: row.oldest_fetched_message_id,
-      fetchedMessageCount: row.fetched_message_count,
-      retryCount: row.retry_count
-    };
-  }
-
-  markBackfillTargetRunning(targetId: number): void {
-    this.db.prepare("UPDATE backfill_targets SET status = 'running', started_at = coalesce(started_at, ?), updated_at = ?, last_error = NULL WHERE id = ?").run(now(), now(), targetId);
-  }
-
-  markBackfillTargetProgress(targetId: number, oldestFetchedMessageId: string | null, fetchedCount: number): void {
-    this.db.prepare(`
-      UPDATE backfill_targets
-      SET oldest_fetched_message_id = coalesce(?, oldest_fetched_message_id),
-          fetched_message_count = fetched_message_count + ?,
-          updated_at = ?
-      WHERE id = ?
-    `).run(oldestFetchedMessageId, fetchedCount, now(), targetId);
-  }
-
-  markBackfillTargetCompleted(targetId: number): void {
-    this.db.prepare("UPDATE backfill_targets SET status = 'completed', updated_at = ?, completed_at = ? WHERE id = ?").run(now(), now(), targetId);
-  }
-
-  markBackfillTargetFailed(targetId: number, error: string): void {
-    const row = this.db.prepare("SELECT retry_count FROM backfill_targets WHERE id = ?").get(targetId) as { retry_count: number } | undefined;
-    const retryCount = (row?.retry_count ?? 0) + 1;
-    this.db.prepare("UPDATE backfill_targets SET status = ?, retry_count = ?, last_error = ?, updated_at = ? WHERE id = ?").run(
-      retryCount >= 3 ? "failed" : "pending",
-      retryCount,
-      error.slice(0, 500),
-      now(),
-      targetId
-    );
-  }
-
-  backfillStatus(): BackfillStatus | undefined {
-    const job = this.db.prepare("SELECT * FROM backfill_jobs ORDER BY id DESC LIMIT 1").get() as {
-      id: number;
-      status: string;
-      scope: string;
-      started_at: string;
-      updated_at: string;
-      completed_at: string | null;
-      last_error: string | null;
-    } | undefined;
-    if (!job) return undefined;
-
-    const counts = this.db.prepare(`
-      SELECT
-        count(*) AS total,
-        sum(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-        sum(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
-        sum(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
-        sum(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-        sum(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped,
-        sum(fetched_message_count) AS fetched
-      FROM backfill_targets
-      WHERE job_id = ?
-    `).get(job.id) as { total: number; completed: number | null; running: number | null; pending: number | null; failed: number | null; skipped: number | null; fetched: number | null };
-    const current = this.db.prepare(`
-      SELECT channel_id, type, fetched_message_count, last_error
-      FROM backfill_targets
-      WHERE job_id = ? AND status IN ('running', 'failed')
-      ORDER BY status = 'running' DESC, id
-      LIMIT 1
-    `).get(job.id) as { channel_id: string; type: string; fetched_message_count: number; last_error: string | null } | undefined;
-
-    return {
-      job: {
-        id: job.id,
-        status: job.status,
-        scope: job.scope,
-        updatedAt: job.updated_at,
-        lastError: job.last_error
-      },
-      counts: {
-        total: counts.total,
-        completed: counts.completed ?? 0,
-        running: counts.running ?? 0,
-        pending: counts.pending ?? 0,
-        failed: counts.failed ?? 0,
-        skipped: counts.skipped ?? 0,
-        fetched: counts.fetched ?? 0
-      },
-      current: current ? {
-        channelId: current.channel_id,
-        type: current.type,
-        fetchedMessageCount: current.fetched_message_count,
-        lastError: current.last_error
-      } : undefined
-    };
-  }
-
-  searchMemory(input: {
-    query: string;
-    currentChannelId: string;
-    excludeMessageIds?: string[];
-    limit?: number;
-    contextRadius?: number;
-  }): MemorySearchResult {
-    const query = ftsQueryFromText(input.query);
-    const substringTerms = twoCharacterHanTerms(input.query);
-    const limit = input.limit ?? 20;
-    if (!query && !substringTerms.length) return { query: "", hits: [], contextMessages: [], sources: [] };
-
-    const excludeMessageIds = input.excludeMessageIds ?? [];
-    const exactChannelIds = [input.currentChannelId];
-    const ftsHits = query ? this.searchMemoryScope(query, exactChannelIds, limit, excludeMessageIds) : [];
-    const substringHits = substringTerms.length
-      ? this.searchMemorySubstringScope(substringTerms, exactChannelIds, limit, excludeMessageIds)
-      : [];
-    const hits = uniquePromptRefs([...ftsHits, ...substringHits]).slice(0, limit);
-    const contextMessages = boundedContextMessages(
-      uniquePromptRefs(hits.flatMap((hit) => this.contextForMessage(hit.id, input.contextRadius ?? 5))),
-      hits,
-      limit
-    );
-    const sources = hits.slice(0, 3).map((hit) => `<#${hit.channelId ?? "unknown"}> / ${hit.authorName ?? hit.authorId} / ${hit.createdAt} / ${hit.url}`);
-    return { query: query ?? substringTerms.join(" OR "), hits, contextMessages, sources };
-  }
-
-  searchSemanticMemory(input: {
-    embedding: number[];
-    model: string;
-    currentChannelId: string;
-    excludeMessageIds?: string[];
-    limit?: number;
-    contextRadius?: number;
-  }): MemorySearchResult {
-    const limit = input.limit ?? 20;
-    const excludeMessageIds = input.excludeMessageIds ?? [];
-    const hits = this.searchSemanticMemoryScope(input.embedding, input.model, [input.currentChannelId], limit, excludeMessageIds);
-    const contextMessages = boundedContextMessages(
-      uniquePromptRefs(hits.flatMap((hit) => this.contextForMessage(hit.id, input.contextRadius ?? 5))),
-      hits,
-      limit
-    );
-    const sources = hits.slice(0, 3).map(promptSource);
-    return { query: "embedding", hits, contextMessages, sources };
-  }
-
-  recentMessages(channelId: string, limit: number, excludeMessageIds: string[] = []): PromptMessageRef[] {
-    if (!channelId) return [];
-    const excluded = excludeMessageIds.filter(Boolean);
-    const excludeClause = excluded.length ? `AND message_id NOT IN (${excluded.map(() => "?").join(", ")})` : "";
-    return this.db.prepare(`
-      SELECT message_id, channel_id, parent_channel_id, author_id, author_name, content, created_at, message_url
-      FROM messages
-      WHERE channel_id = ?
-        ${excludeClause}
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).all(channelId, ...excluded, limit).reverse().map((row) => this.promptRefFromRow(row));
   }
 
   setting(key: string): string | undefined {
@@ -712,385 +472,6 @@ export class Store {
     markSteamFreeExpired(this.db, appId);
   }
 
-  rememberMessage(message: StoredMessage): void {
-    const timestamp = now();
-    this.db.exec("BEGIN");
-    try {
-      this.db.prepare(`
-        INSERT INTO messages
-          (message_id, guild_id, channel_id, parent_channel_id, author_id, author_name, content, created_at, edited_at, edited_flag, referenced_message_id, message_url, has_attachments)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(message_id) DO UPDATE SET
-          guild_id = excluded.guild_id,
-          channel_id = excluded.channel_id,
-          parent_channel_id = excluded.parent_channel_id,
-          author_id = excluded.author_id,
-          author_name = excluded.author_name,
-          content = excluded.content,
-          edited_at = excluded.edited_at,
-          edited_flag = excluded.edited_flag,
-          referenced_message_id = excluded.referenced_message_id,
-          message_url = excluded.message_url,
-          has_attachments = excluded.has_attachments
-      `).run(
-        message.messageId,
-        message.guildId,
-        message.channelId,
-        message.parentChannelId,
-        message.authorId,
-        message.authorName,
-        message.content,
-        message.createdAt,
-        message.editedAt,
-        message.editedFlag ? 1 : 0,
-        message.referencedMessageId,
-        message.messageUrl,
-        message.attachments.length ? 1 : 0
-      );
-      this.deleteRemovedAttachments(message.messageId, message.attachments.map((attachment) => attachment.attachmentId));
-      for (const attachment of message.attachments) {
-        this.db.prepare(`
-          INSERT INTO attachments
-            (attachment_id, message_id, filename, content_type, size_bytes, last_seen_url, proxy_url, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(attachment_id) DO UPDATE SET
-            message_id = excluded.message_id,
-            filename = excluded.filename,
-            content_type = excluded.content_type,
-            size_bytes = excluded.size_bytes,
-            last_seen_url = excluded.last_seen_url,
-            proxy_url = excluded.proxy_url,
-            updated_at = excluded.updated_at
-        `).run(
-          attachment.attachmentId,
-          attachment.messageId,
-          attachment.filename,
-          attachment.contentType,
-          attachment.sizeBytes,
-          attachment.lastSeenUrl,
-          attachment.proxyUrl,
-          timestamp,
-          timestamp
-        );
-      }
-      this.refreshMessageFts(message.messageId);
-      this.queueMessageEmbedding(message.messageId);
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  deleteRememberedMessage(messageId: string): boolean {
-    if (!this.db.prepare("SELECT 1 FROM messages WHERE message_id = ?").get(messageId)) return false;
-
-    this.db.exec("BEGIN");
-    try {
-      this.db.prepare("DELETE FROM attachment_extractions WHERE message_id = ?").run(messageId);
-      this.db.prepare("DELETE FROM attachments WHERE message_id = ?").run(messageId);
-      this.db.prepare("DELETE FROM message_embeddings WHERE message_id = ?").run(messageId);
-      this.db.prepare("DELETE FROM message_fts WHERE message_id = ?").run(messageId);
-      this.db.prepare("DELETE FROM messages WHERE message_id = ?").run(messageId);
-      this.db.exec("COMMIT");
-      return true;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
-
-  saveAttachmentExtraction(input: {
-    attachmentId: string;
-    messageId: string;
-    filename: string | null;
-    contentType: string | null;
-    sizeBytes: number;
-    extractedText: string;
-    extractionMethod: string;
-  }): void {
-    this.db.prepare("DELETE FROM attachment_extractions WHERE attachment_id = ?").run(input.attachmentId);
-    this.db.prepare(`
-      INSERT INTO attachment_extractions
-        (attachment_id, message_id, filename, content_type, size_bytes, extracted_text, extraction_method, extracted_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      input.attachmentId,
-      input.messageId,
-      input.filename,
-      input.contentType,
-      input.sizeBytes,
-      input.extractedText,
-      input.extractionMethod,
-      now()
-    );
-    this.refreshMessageFts(input.messageId);
-    this.queueMessageEmbedding(input.messageId);
-  }
-
-  private deleteRemovedAttachments(messageId: string, attachmentIds: string[]): void {
-    if (!attachmentIds.length) {
-      this.db.prepare("DELETE FROM attachment_extractions WHERE message_id = ?").run(messageId);
-      this.db.prepare("DELETE FROM attachments WHERE message_id = ?").run(messageId);
-      return;
-    }
-    const placeholders = attachmentIds.map(() => "?").join(", ");
-    this.db.prepare(`DELETE FROM attachment_extractions WHERE message_id = ? AND attachment_id NOT IN (${placeholders})`).run(messageId, ...attachmentIds);
-    this.db.prepare(`DELETE FROM attachments WHERE message_id = ? AND attachment_id NOT IN (${placeholders})`).run(messageId, ...attachmentIds);
-  }
-
-  private refreshMessageFts(messageId: string): void {
-    const row = this.db.prepare("SELECT message_id, channel_id, author_name, content FROM messages WHERE message_id = ?").get(messageId) as {
-      message_id: string;
-      channel_id: string;
-      author_name: string | null;
-      content: string | null;
-    } | undefined;
-    if (!row) return;
-
-    const extractionRows = this.db.prepare("SELECT extracted_text FROM attachment_extractions WHERE message_id = ?").all(messageId) as Array<{ extracted_text: string | null }>;
-    const content = [row.content, ...extractionRows.map((item) => item.extracted_text)].filter(Boolean).join("\n");
-    this.db.prepare("DELETE FROM message_fts WHERE message_id = ?").run(messageId);
-    this.db.prepare("INSERT INTO message_fts (message_id, channel_id, author_name, content) VALUES (?, ?, ?, ?)").run(
-      row.message_id,
-      row.channel_id,
-      row.author_name,
-      content
-    );
-  }
-
-  private embeddingTextForMessage(messageId: string): string {
-    const row = this.db.prepare("SELECT content FROM message_fts WHERE message_id = ?").get(messageId) as { content: string | null } | undefined;
-    return (row?.content ?? "").replace(/\s+/g, " ").trim();
-  }
-
-  private queueMessageEmbedding(messageId: string): void {
-    if (!this.embeddingTextForMessage(messageId)) {
-      this.db.prepare("DELETE FROM message_embeddings WHERE message_id = ?").run(messageId);
-      return;
-    }
-    this.db.prepare(`
-      INSERT INTO message_embeddings
-        (message_id, model, embedding_json, dimension, status, retry_count, last_error, updated_at,
-         pending_model, pending_retry_count, pending_error, pending_updated_at)
-      VALUES (?, '', NULL, NULL, 'pending', 0, NULL, ?, '', 0, NULL, ?)
-      ON CONFLICT(message_id) DO UPDATE SET
-        status = CASE WHEN message_embeddings.embedding_json IS NULL THEN 'pending' ELSE message_embeddings.status END,
-        pending_model = '',
-        pending_retry_count = 0,
-        pending_error = NULL,
-        pending_updated_at = excluded.pending_updated_at
-    `).run(messageId, now(), now());
-  }
-
-  pendingMessageEmbeddings(model: string, limit: number): Array<{ messageId: string; text: string }> {
-    this.db.prepare(`
-      UPDATE message_embeddings
-      SET pending_model = NULL, pending_retry_count = 0, pending_error = NULL, pending_updated_at = NULL
-      WHERE embedding_json IS NOT NULL AND model = ? AND pending_model IS NOT NULL AND pending_model != ''
-    `).run(model);
-    return this.db.prepare(`
-      SELECT e.message_id, message_fts.content
-      FROM message_embeddings e
-      JOIN message_fts ON message_fts.message_id = e.message_id
-      WHERE length(trim(message_fts.content)) > 0
-        AND e.pending_retry_count < 10
-        AND (e.embedding_json IS NULL OR e.model != ? OR e.pending_model = '')
-      ORDER BY coalesce(e.pending_updated_at, e.updated_at) ASC
-      LIMIT ?
-    `).all(model, limit).map((row) => ({
-      messageId: String((row as { message_id: unknown }).message_id),
-      text: String((row as { content: unknown }).content)
-    }));
-  }
-
-  saveMessageEmbedding(messageId: string, model: string, embedding: number[]): void {
-    this.db.prepare(`
-      INSERT INTO message_embeddings
-        (message_id, model, embedding_json, dimension, status, retry_count, last_error, updated_at,
-         pending_model, pending_retry_count, pending_error, pending_updated_at)
-      VALUES (?, ?, ?, ?, 'completed', 0, NULL, ?, NULL, 0, NULL, NULL)
-      ON CONFLICT(message_id) DO UPDATE SET
-        model = excluded.model,
-        embedding_json = excluded.embedding_json,
-        dimension = excluded.dimension,
-        status = 'completed',
-        retry_count = 0,
-        last_error = NULL,
-        updated_at = excluded.updated_at,
-        pending_model = NULL,
-        pending_retry_count = 0,
-        pending_error = NULL,
-        pending_updated_at = NULL
-    `).run(messageId, model, JSON.stringify(embedding), embedding.length, now());
-  }
-
-  markMessageEmbeddingFailed(messageId: string, model: string, error: string): void {
-    this.db.prepare(`
-      INSERT INTO message_embeddings
-        (message_id, model, embedding_json, dimension, status, retry_count, last_error, updated_at,
-         pending_model, pending_retry_count, pending_error, pending_updated_at)
-      VALUES (?, '', NULL, NULL, 'failed', 1, ?, ?, ?, 1, ?, ?)
-      ON CONFLICT(message_id) DO UPDATE SET
-        status = CASE WHEN message_embeddings.embedding_json IS NULL THEN 'failed' ELSE message_embeddings.status END,
-        retry_count = CASE WHEN message_embeddings.pending_model = excluded.pending_model THEN message_embeddings.retry_count + 1 ELSE 1 END,
-        last_error = excluded.last_error,
-        pending_model = excluded.pending_model,
-        pending_retry_count = CASE WHEN message_embeddings.pending_model = excluded.pending_model THEN message_embeddings.pending_retry_count + 1 ELSE 1 END,
-        pending_error = excluded.pending_error,
-        pending_updated_at = excluded.pending_updated_at
-    `).run(messageId, error.slice(0, 500), now(), model, error.slice(0, 500), now());
-  }
-
-  embeddingBacklogStats(model: string): { pending: number; failed: number } {
-    const row = this.db.prepare(`
-      SELECT
-        sum(CASE WHEN pending_retry_count < 10 AND (embedding_json IS NULL OR message_embeddings.model != ? OR pending_model = '') THEN 1 ELSE 0 END) AS pending,
-        sum(CASE WHEN pending_retry_count >= 10 AND (embedding_json IS NULL OR message_embeddings.model != ? OR pending_model = '') THEN 1 ELSE 0 END) AS failed
-      FROM message_embeddings
-    `).get(model, model) as { pending: number | null; failed: number | null };
-    return { pending: row.pending ?? 0, failed: row.failed ?? 0 };
-  }
-
-  private searchMemoryScope(query: string, channelIds: string[], limit: number, excludeMessageIds: string[]): PromptMessageRef[] {
-    const scope = [...new Set(channelIds.filter(Boolean))];
-    if (!scope.length) return [];
-
-    const placeholders = scope.map(() => "?").join(", ");
-    const excluded = excludeMessageIds.filter(Boolean);
-    const excludeClause = excluded.length ? `AND m.message_id NOT IN (${excluded.map(() => "?").join(", ")})` : "";
-    return this.db.prepare(`
-      SELECT m.message_id, m.channel_id, m.parent_channel_id, m.author_id, m.author_name, m.content, m.created_at, m.message_url
-      FROM message_fts
-      JOIN messages m ON m.message_id = message_fts.message_id
-      WHERE message_fts MATCH ?
-        AND m.channel_id IN (${placeholders})
-        ${excludeClause}
-      ORDER BY bm25(message_fts)
-      LIMIT ?
-    `).all(query, ...scope, ...excluded, limit).map((row) => this.promptRefFromRow(row));
-  }
-
-  private searchMemorySubstringScope(terms: string[], channelIds: string[], limit: number, excludeMessageIds: string[]): PromptMessageRef[] {
-    const scope = [...new Set(channelIds.filter(Boolean))];
-    if (!scope.length || !terms.length) return [];
-
-    const placeholders = scope.map(() => "?").join(", ");
-    const excluded = excludeMessageIds.filter(Boolean);
-    const excludeClause = excluded.length ? `AND m.message_id NOT IN (${excluded.map(() => "?").join(", ")})` : "";
-    const termClause = terms.map(() => "instr(message_fts.content, ?) > 0").join(" OR ");
-    return this.db.prepare(`
-      SELECT m.message_id, m.channel_id, m.parent_channel_id, m.author_id, m.author_name, m.content, m.created_at, m.message_url
-      FROM message_fts
-      JOIN messages m ON m.message_id = message_fts.message_id
-      WHERE m.channel_id IN (${placeholders})
-        AND (${termClause})
-        ${excludeClause}
-      ORDER BY m.created_at DESC
-      LIMIT ?
-    `).all(...scope, ...terms, ...excluded, limit).map((row) => this.promptRefFromRow(row));
-  }
-
-  private searchSemanticMemoryScope(embedding: number[], model: string, channelIds: string[], limit: number, excludeMessageIds: string[]): PromptMessageRef[] {
-    const scope = [...new Set(channelIds.filter(Boolean))];
-    if (!scope.length || !embedding.length) return [];
-
-    const placeholders = scope.map(() => "?").join(", ");
-    const excluded = excludeMessageIds.filter(Boolean);
-    const excludeClause = excluded.length ? `AND m.message_id NOT IN (${excluded.map(() => "?").join(", ")})` : "";
-    const startedAt = Date.now();
-    const rows = this.db.prepare(`
-      SELECT m.message_id, m.channel_id, m.parent_channel_id, m.author_id, m.author_name, m.content, m.created_at, m.message_url, e.embedding_json
-      FROM message_embeddings e
-      JOIN messages m ON m.message_id = e.message_id
-      WHERE e.model = ?
-        AND e.embedding_json IS NOT NULL
-        AND m.channel_id IN (${placeholders})
-        ${excludeClause}
-      ORDER BY m.created_at DESC
-    `).all(model, ...scope, ...excluded) as Array<Record<string, unknown>>;
-
-    const hits = rows
-      .map((row) => ({
-        row,
-        score: cosineSimilarity(embedding, parseEmbeddingJson(row.embedding_json))
-      }))
-      .filter((item): item is { row: Record<string, unknown>; score: number } => typeof item.score === "number")
-      .sort((left, right) => right.score - left.score)
-      .slice(0, limit)
-      .map((item) => this.promptRefFromRow(item.row));
-    const elapsedMs = Date.now() - startedAt;
-    if (rows.length > 2_000 || elapsedMs > 500) {
-      console.warn(`semantic_memory_slow candidates=${rows.length} elapsed_ms=${elapsedMs}`);
-    }
-    return hits;
-  }
-
-  private contextForMessage(messageId: string, radius: number): PromptMessageRef[] {
-    const row = this.db.prepare("SELECT channel_id, created_at FROM messages WHERE message_id = ?").get(messageId) as { channel_id: string; created_at: string } | undefined;
-    if (!row) return [];
-
-    const before = this.db.prepare(`
-      SELECT message_id, channel_id, parent_channel_id, author_id, author_name, content, created_at, message_url
-      FROM messages
-      WHERE channel_id = ? AND created_at < ?
-      ORDER BY created_at DESC
-      LIMIT ?
-    `).all(row.channel_id, row.created_at, radius).reverse();
-    const center = this.db.prepare(`
-      SELECT message_id, channel_id, parent_channel_id, author_id, author_name, content, created_at, message_url
-      FROM messages
-      WHERE message_id = ?
-    `).all(messageId);
-    const after = this.db.prepare(`
-      SELECT message_id, channel_id, parent_channel_id, author_id, author_name, content, created_at, message_url
-      FROM messages
-      WHERE channel_id = ? AND created_at > ?
-      ORDER BY created_at ASC
-      LIMIT ?
-    `).all(row.channel_id, row.created_at, radius);
-    return [...before, ...center, ...after].map((message) => this.promptRefFromRow(message));
-  }
-
-  private promptRefFromRow(row: unknown): PromptMessageRef {
-    const ref = rowToPromptRef(row);
-    const attachments = this.db.prepare(`
-      SELECT attachment_id, filename, content_type, size_bytes, last_seen_url
-      FROM attachments
-      WHERE message_id = ?
-      ORDER BY created_at, attachment_id
-    `).all(ref.id) as Array<{
-      attachment_id: string;
-      filename: string | null;
-      content_type: string | null;
-      size_bytes: number;
-      last_seen_url: string;
-    }>;
-    const extractions = this.db.prepare(`
-      SELECT attachment_id, filename, extracted_text
-      FROM attachment_extractions
-      WHERE message_id = ?
-      ORDER BY extracted_at, attachment_id
-    `).all(ref.id) as Array<{ attachment_id: string; filename: string | null; extracted_text: string }>;
-
-    const result: PromptMessageRef = { ...ref };
-    if (attachments.length) {
-      result.attachments = attachments.map((attachment) => [
-        attachment.filename ?? attachment.attachment_id,
-        attachment.content_type ?? "unknown",
-        `${attachment.size_bytes} bytes`,
-        attachment.last_seen_url
-      ].join(" | "));
-      result.imageUrls = attachments
-        .filter((attachment) => isLikelyImageAttachment(attachment.filename, attachment.content_type))
-        .map((attachment) => attachment.last_seen_url);
-    }
-    if (extractions.length) {
-      result.attachmentExtractions = extractions.map((extraction) => `${extraction.filename ?? extraction.attachment_id}:\n${extraction.extracted_text}`);
-    }
-    return result;
-  }
-
   addRole(roleId: string, actor: UserRef): boolean {
     if (!this.db.prepare("SELECT 1 FROM ai_allowed_roles WHERE role_id = ?").get(roleId) && this.tableCount("ai_allowed_roles") >= SELECTOR_LIMIT) {
       throw new Error("ai_allowed_roles_limit_reached");
@@ -1112,8 +493,8 @@ export class Store {
     }
     const changed = this.db.prepare(`
       INSERT OR IGNORE INTO ai_channel_whitelist
-        (channel_id, include_threads, memory_enabled, backfill_enabled, created_by, created_at)
-      VALUES (?, 1, 0, 1, ?, ?)
+        (channel_id, created_by, created_at)
+      VALUES (?, ?, ?)
     `).run(channelId, actor.id, now()).changes > 0;
     this.audit(actor, "ai-settings", "allow_channel", "channel", channelId, changed ? null : channelId, channelId, changed ? "ok" : "no_change");
     return changed;
@@ -1123,33 +504,6 @@ export class Store {
     const changed = this.db.prepare("DELETE FROM ai_channel_whitelist WHERE channel_id = ?").run(channelId).changes > 0;
     this.audit(actor, "ai-settings", "deny_channel", "channel", channelId, changed ? channelId : null, null, changed ? "ok" : "no_change");
     return changed;
-  }
-
-  setChannelMemoryEnabled(channelId: string, enabled: boolean, actor: UserRef): boolean {
-    const oldValue = this.db.prepare("SELECT memory_enabled FROM ai_channel_whitelist WHERE channel_id = ?").get(channelId) as { memory_enabled: number } | undefined;
-    if (!oldValue || Boolean(oldValue.memory_enabled) === enabled) return false;
-    this.db.prepare("UPDATE ai_channel_whitelist SET memory_enabled = ? WHERE channel_id = ?").run(enabled ? 1 : 0, channelId);
-    this.audit(actor, "ai-settings", enabled ? "enable_memory" : "disable_memory", "channel", channelId, String(Boolean(oldValue.memory_enabled)), String(enabled), "ok");
-    return true;
-  }
-
-  clearChannelMemory(channelId: string, actor: UserRef): number {
-    const count = Number((this.db.prepare("SELECT count(*) AS count FROM messages WHERE channel_id = ?").get(channelId) as { count: unknown }).count);
-    if (!count) return 0;
-    this.db.exec("BEGIN");
-    try {
-      for (const table of ["attachment_extractions", "attachments", "message_embeddings", "message_fts"] as const) {
-        this.db.prepare(`DELETE FROM ${table} WHERE message_id IN (SELECT message_id FROM messages WHERE channel_id = ?)`)
-          .run(channelId);
-      }
-      this.db.prepare("DELETE FROM messages WHERE channel_id = ?").run(channelId);
-      this.audit(actor, "ai-settings", "clear_memory", "channel", channelId, String(count), "0", "ok");
-      this.db.exec("COMMIT");
-      return count;
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
   }
 
   addSettingsRole(roleId: string, actor: UserRef): boolean {
@@ -1238,9 +592,9 @@ export class Store {
     latencyMs?: number;
     inputTokens?: number;
     outputTokens?: number;
-  }): void {
+  }): number {
     this.pruneAiRequestLogs();
-    this.db.prepare(`
+    const result = this.db.prepare(`
       INSERT INTO ai_request_logs
         (actor_id, channel_id, source_message_id, trigger_type, task_type, model_alias, fallback_chain, status, error_type, latency_ms, input_tokens, output_tokens, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1259,6 +613,58 @@ export class Store {
       input.outputTokens ?? null,
       now()
     );
+    return Number(result.lastInsertRowid);
+  }
+
+  recordAiResponseMessages(requestLogId: number, messageIds: string[], createdAt = now()): void {
+    if (!messageIds.length || messageIds.some((messageId) => !messageId)) {
+      throw new Error("ai_response_messages_invalid");
+    }
+    if (new Set(messageIds).size !== messageIds.length) {
+      throw new Error("ai_response_messages_duplicate");
+    }
+    const request = this.db.prepare("SELECT status FROM ai_request_logs WHERE id = ?").get(requestLogId) as { status: string } | undefined;
+    if (request?.status !== "ok") throw new Error("ai_response_request_not_successful");
+    this.db.exec("BEGIN");
+    try {
+      const insert = this.db.prepare(`
+        INSERT INTO ai_response_messages (request_log_id, message_id, segment_index, created_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const [segmentIndex, messageId] of messageIds.entries()) {
+        insert.run(requestLogId, messageId, segmentIndex, createdAt);
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original insert error.
+      }
+      throw error;
+    }
+  }
+
+  aiResponseChain(messageId: string): { requestLogId: number; sourceMessageId: string; channelId: string; responseMessageIds: string[] } | undefined {
+    const row = this.db.prepare(`
+      SELECT response.request_log_id, logs.channel_id, logs.source_message_id
+      FROM ai_response_messages response
+      JOIN ai_request_logs logs ON logs.id = response.request_log_id
+      WHERE response.message_id = ? AND logs.status = 'ok'
+    `).get(messageId) as { request_log_id: number; channel_id: string; source_message_id: string | null } | undefined;
+    if (!row?.source_message_id) return undefined;
+    const responseMessageIds = this.db.prepare(`
+      SELECT message_id
+      FROM ai_response_messages
+      WHERE request_log_id = ?
+      ORDER BY segment_index
+    `).all(row.request_log_id).map((item) => String((item as { message_id: unknown }).message_id));
+    return {
+      requestLogId: row.request_log_id,
+      sourceMessageId: row.source_message_id,
+      channelId: row.channel_id,
+      responseMessageIds
+    };
   }
 
   pruneAiRequestLogs(): number {
@@ -1276,30 +682,7 @@ export function now(): string {
   return new Date().toISOString();
 }
 
-function rowToPromptRef(row: unknown): PromptMessageRef {
-  const message = row as {
-    message_id: string;
-    channel_id: string;
-    author_id: string;
-    author_name: string | null;
-    content: string | null;
-    created_at: string;
-    message_url: string;
-  };
-  return {
-    id: message.message_id,
-    channelId: message.channel_id,
-    authorId: message.author_id,
-    authorName: message.author_name,
-    content: message.content ?? "",
-    createdAt: message.created_at,
-    url: message.message_url
-  };
-}
-
 function redact(key: string, value?: string | null): string | null {
   if (value == null) return null;
   return /key|password|secret/i.test(key) ? "[redacted]" : value;
 }
-
-

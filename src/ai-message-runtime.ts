@@ -1,32 +1,18 @@
-import { type Client, type Message } from "discord.js";
+import type { Message } from "discord.js";
 import { buildMentionMessages } from "./ai-prompts.js";
-import {
-  aiError,
-  callAiProvider,
-  callEmbeddingProvider,
-  embeddingDocumentText,
-  embeddingProviderConfig,
-  embeddingQueryText
-} from "./ai-service.js";
-import {
-  regexIntentRoute,
-  shouldSearchMemory,
-  shouldUseRecentContext,
-  type IntentRoute
-} from "./ai-routing.js";
+import { aiError, callAiProvider } from "./ai-service.js";
+import { regexIntentRoute, type IntentRoute } from "./ai-routing.js";
 import type { Config } from "./config.js";
 import { aiAccessForMessage } from "./discord-message-runtime.js";
+import type { PromptMessageRef } from "./prompt-types.js";
 import {
-  boundedContextMessages,
-  promptSource,
-  uniquePromptRefs,
-  type MemorySearchResult,
-  type PromptMessageRef
-} from "./memory.js";
-import { attachmentLimitError, resolvePromptMessageRef } from "./prompt-message-ref.js";
-import { runtimeSettingsFromStore } from "./runtime-settings.js";
-import { Store } from "./store.js";
-import { DISCORD_ERROR_TEXT, safeMentions, splitDiscordText, stripBotMention } from "./text.js";
+  attachmentLimitError,
+  promptRefFromDiscordMessage,
+  resolvePromptMessageRef
+} from "./prompt-message-ref.js";
+import { runtimeSettingsFromStore, type ResolvedRuntimeSettings } from "./runtime-settings.js";
+import type { Store } from "./store.js";
+import { DISCORD_ERROR_TEXT, safeMentions, stripBotMention } from "./text.js";
 
 type SendableChannel = {
   send(options: unknown): Promise<unknown>;
@@ -36,72 +22,107 @@ type TypingChannel = {
   sendTyping(): Promise<unknown>;
 };
 
-const AI_USER_COOLDOWN_MS = 10_000;
-const AI_MESSAGE_DEDUP_MS = 10 * 60_000;
-const AI_MAX_IN_FLIGHT = 2;
-const DISCORD_RESPONSE_CHAR_LIMIT = 12_000;
-const DISCORD_RESPONSE_CHUNK_LIMIT = 6;
+type AiResponseChain = {
+  requestLogId: number;
+  sourceMessageId: string | null;
+  channelId: string;
+  responseMessageIds: string[];
+};
 
+type AiRequestLogInput = {
+  actorId: string;
+  channelId: string;
+  sourceMessageId: string | null;
+  triggerType: string;
+  taskType: string;
+  modelAlias?: string;
+  status: string;
+  errorType?: string;
+  latencyMs?: number;
+  inputTokens?: number;
+  outputTokens?: number;
+};
+
+type AiRuntimeStore = {
+  setting(key: string): string | undefined;
+  logAiRequest(input: AiRequestLogInput): number;
+  recordAiResponseMessages(requestLogId: number, messageIds: string[]): void;
+  aiResponseChain(messageId: string): AiResponseChain | undefined;
+};
+
+type TriggerContext = {
+  triggerType: "mention" | "reply_to_bot";
+  referencedMessage: Message | null;
+  chain?: AiResponseChain;
+};
+
+type AiJob = {
+  message: Message;
+  store: Store;
+  runtimeStore: AiRuntimeStore;
+  config: Config;
+  runtime: ResolvedRuntimeSettings;
+  trigger: TriggerContext;
+  userId: string;
+  stopTyping: () => void;
+  queuedTimer?: ReturnType<typeof setTimeout>;
+};
+const AI_MESSAGE_DEDUP_MS = 10 * 60_000;
+
+const queuedJobs: AiJob[] = [];
+const activeJobs = new Set<AiJob>();
+const admittedByUser = new Map<string, AiJob>();
 const aiUserCooldowns = new Map<string, number>();
 const recentAiMessageIds = new Map<string, number>();
-let activeAiRequests = 0;
+let aiRuntimeStopped = false;
 
-async function memoryForQuestion(store: Store, config: Config, question: string, currentChannelId: string, summaryMessageLimit: number, excludeMessageIds: string[] = [], route?: IntentRoute): Promise<MemorySearchResult | undefined> {
-  const useMemory = route ? route.useMemory || route.useRecentContext : shouldSearchMemory(question);
-  const useRecent = route ? route.useRecentContext : shouldUseRecentContext(question);
-  if (!useMemory && !useRecent) return undefined;
-  if (!store.listMemoryChannels().includes(currentChannelId)) {
-    return { query: "", hits: [], contextMessages: [], sources: [] };
-  }
-
-  if (useRecent) {
-    const recent = store.recentMessages(currentChannelId, summaryMessageLimit, excludeMessageIds);
-    return {
-      query: "(近期對話)",
-      hits: [],
-      contextMessages: recent,
-      sources: recent.slice(-3).map(promptSource)
-    };
-  }
-
-  const memory = store.searchMemory({
-    query: question,
-    currentChannelId,
-    excludeMessageIds,
-    limit: summaryMessageLimit
-  });
-  if (route ? route.useMemory : shouldSearchMemory(question)) {
-    const semantic = await semanticMemoryForQuestion(store, config, question, currentChannelId, summaryMessageLimit, excludeMessageIds);
-    if (semantic) {
-      memory.hits = uniquePromptRefs([...memory.hits, ...semantic.hits]).slice(0, summaryMessageLimit);
-      memory.contextMessages = boundedContextMessages(
-        uniquePromptRefs([...memory.contextMessages, ...semantic.contextMessages]),
-        memory.hits,
-        summaryMessageLimit
-      );
-      memory.sources = [...new Set([...memory.sources, ...semantic.sources])].slice(0, 3);
-      memory.query = memory.query || semantic.query;
-    }
-  }
-  return useMemory ? memory : undefined;
+function runtimeStore(store: Store): AiRuntimeStore {
+  return store as unknown as AiRuntimeStore;
 }
 
-async function semanticMemoryForQuestion(store: Store, config: Config, question: string, currentChannelId: string, limit: number, excludeMessageIds: string[]): Promise<MemorySearchResult | undefined> {
-  try {
-    const { model } = embeddingProviderConfig(config);
-    const [embedding] = await callEmbeddingProvider(config, [embeddingQueryText(question)]);
-    if (!embedding?.length) return undefined;
-    const result = store.searchSemanticMemory({
-      embedding,
-      model,
-      currentChannelId,
-      excludeMessageIds,
-      limit
-    });
-    return result.hits.length ? result : undefined;
-  } catch {
-    return undefined;
+function modelAlias(store: Store, config: Config): string {
+  return store.setting("ai_model")?.trim() || config.aiModel.trim() || "gemini/gemini-3.6-flash";
+}
+
+function cleanupAdmissionMaps(now = Date.now()): void {
+  for (const [id, expiresAt] of recentAiMessageIds) {
+    if (expiresAt <= now) recentAiMessageIds.delete(id);
   }
+  for (const [id, expiresAt] of aiUserCooldowns) {
+    if (expiresAt <= now) aiUserCooldowns.delete(id);
+  }
+}
+
+function replyMentions(runtime: ResolvedRuntimeSettings): { parse: []; repliedUser: boolean } {
+  return { parse: [], repliedUser: runtime.replyMentionUser };
+}
+
+async function safeReply(message: Message, content: string, runtime: ResolvedRuntimeSettings): Promise<void> {
+  try {
+    await message.reply({ content, allowedMentions: replyMentions(runtime) });
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function cooldownText(): string {
+  return "AI 使用量已達上限，請稍後再試。（AI-RATE-001）";
+}
+
+function sameUserText(): string {
+  return "AI 使用量已達上限，請稍後再試。（AI-RATE-001）";
+}
+
+function queueFullText(): string {
+  return "AI 使用量已達上限，請稍後再試。（AI-RATE-001）";
+}
+
+function queueTimeoutText(): string {
+  return "AI 請求等候逾時，請稍後重試。（AI-QUEUE-001）";
+}
+
+function queueShutdownText(): string {
+  return "正常重啟已取消佇列中的 AI 請求，請稍後重試。（AI-QUEUE-002）";
 }
 
 async function fetchReferencedMessage(message: Message): Promise<Message | null> {
@@ -112,6 +133,54 @@ async function fetchReferencedMessage(message: Message): Promise<Message | null>
     return null;
   }
 }
+function currentClientUserId(message: Message): string | null {
+  const candidate = (message as Message & { client?: { user?: { id: string } | null } }).client;
+  return candidate?.user?.id ?? null;
+}
+
+function hasBotMention(message: Message, clientUserId: string | null): boolean {
+  if (!clientUserId) return false;
+  const mentions = (message as Message & { mentions?: { users?: { has(id: string): boolean } } }).mentions;
+  return Boolean(mentions?.users?.has(clientUserId));
+}
+
+async function detectTrigger(message: Message, runtimeStoreValue: AiRuntimeStore): Promise<TriggerContext | null> {
+  const clientUserId = currentClientUserId(message);
+  const referencedMessage = await fetchReferencedMessage(message);
+  if (aiRuntimeStopped) return null;
+  if (hasBotMention(message, clientUserId)) {
+    const target = mentionTargetMessage(referencedMessage, message, clientUserId, runtimeStoreValue);
+    return { triggerType: "mention", referencedMessage: target };
+  }
+  if (!referencedMessage) return null;
+  const chain = runtimeStoreValue.aiResponseChain(referencedMessage.id);
+  const referencedAttachments = (referencedMessage as Message & { attachments?: { size?: number } }).attachments;
+  const referencedEmbeds = (referencedMessage as Message & { embeds?: unknown[] }).embeds;
+  const referencedComponents = (referencedMessage as Message & { components?: unknown[] }).components;
+  const attachmentCount = referencedAttachments?.size ?? 0;
+  if (!chain || chain.channelId !== message.channelId || !chain.responseMessageIds.includes(referencedMessage.id) ||
+      referencedMessage.author.id !== clientUserId || !pureTextMessage(referencedMessage) || attachmentCount > 0 ||
+      Boolean(referencedEmbeds?.length) || Boolean(referencedComponents?.length)) return null;
+  return { triggerType: "reply_to_bot", referencedMessage, chain };
+}
+
+function mentionTargetMessage(
+  referenced: Message | null,
+  message: Message,
+  clientUserId: string | null,
+  runtimeStoreValue: AiRuntimeStore
+): Message | null {
+  if (!referenced || referenced.channelId !== message.channelId) return null;
+  const components = (referenced as Message & { components?: unknown[] }).components;
+  const embeds = (referenced as Message & { embeds?: unknown[] }).embeds;
+  if (components?.length || embeds?.length || referenced.system) return null;
+  if (!referenced.author.bot) return referenced.webhookId || !humanTextMessage(referenced) ? null : referenced;
+  if (referenced.author.id !== clientUserId || !pureTextMessage(referenced)) return null;
+  const chain = runtimeStoreValue.aiResponseChain(referenced.id);
+  return chain && chain.channelId === message.channelId && chain.responseMessageIds.includes(referenced.id)
+    ? referenced
+    : null;
+}
 
 function isSendableChannel(channel: Message["channel"]): channel is Message["channel"] & SendableChannel {
   return "send" in channel && typeof channel.send === "function";
@@ -121,177 +190,247 @@ function startTyping(message: Message): () => void {
   const channel = message.channel as Message["channel"] & Partial<TypingChannel>;
   if (typeof channel.sendTyping !== "function") return () => undefined;
   const sendTyping = () => {
-    const promise = channel.sendTyping?.();
-    void promise?.catch(() => undefined);
+    try {
+      const promise = channel.sendTyping?.();
+      void Promise.resolve(promise).catch(() => undefined);
+    } catch {
+      // Typing failures must not block admitted requests.
+    }
   };
   sendTyping();
   const timer = setInterval(sendTyping, 8_000);
+  timer.unref?.();
   return () => clearInterval(timer);
 }
 
-async function replyDiscordChunks(message: Message, content: string, repliedUser: boolean): Promise<void> {
-  const suffix = "\n\n（回覆過長，已截斷）";
-  const safe = safeMentions(content);
-  const bounded = safe.length > DISCORD_RESPONSE_CHAR_LIMIT
-    ? `${safe.slice(0, DISCORD_RESPONSE_CHAR_LIMIT - suffix.length)}${suffix}`
-    : safe;
-  const allChunks = splitDiscordText(bounded);
-  const chunks = allChunks.slice(0, DISCORD_RESPONSE_CHUNK_LIMIT);
-  if (allChunks.length > DISCORD_RESPONSE_CHUNK_LIMIT) {
-    const last = chunks.length - 1;
-    chunks[last] = `${chunks[last].slice(0, 2_000 - suffix.length)}${suffix}`;
+function stripDiscordHistoryUrls(content: string): string {
+  return content.replace(/https?:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/channels\/[^\s>]+/gi, "[Discord 連結已移除]");
+}
+
+function messageId(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const id = (value as { id?: unknown }).id;
+  return typeof id === "string" ? id : undefined;
+}
+
+async function replyDiscordChunks(message: Message, content: string, repliedUser: boolean, responseMaxChars: number): Promise<string[]> {
+  const bounded = stripDiscordHistoryUrls(safeMentions(content)).slice(0, responseMaxChars);
+  const chunks: string[] = [];
+  for (let offset = 0; offset < bounded.length; offset += 2_000) {
+    chunks.push(bounded.slice(offset, offset + 2_000));
   }
-  await message.reply({ content: chunks[0], allowedMentions: { parse: [], repliedUser } });
-  if (!isSendableChannel(message.channel)) return;
+  if (!chunks.length) chunks.push("");
+  const sentMessageIds: string[] = [];
+  const first = await message.reply({ content: chunks[0], allowedMentions: { parse: [], repliedUser } });
+  const firstId = messageId(first);
+  if (!firstId) throw new Error("discord_delivery_missing_message_id");
+  sentMessageIds.push(firstId);
+  if (!isSendableChannel(message.channel)) {
+    if (chunks.length > 1) throw new Error("discord_delivery_channel_not_sendable");
+    return sentMessageIds;
+  }
   for (const chunk of chunks.slice(1)) {
-    await message.channel.send({ content: chunk, allowedMentions: { parse: [] } });
+    const sent = await message.channel.send({ content: chunk, allowedMentions: { parse: [] } });
+    const sentId = messageId(sent);
+    if (!sentId) throw new Error("discord_delivery_missing_message_id");
+    sentMessageIds.push(sentId);
   }
+  return sentMessageIds;
 }
 
-export function startEmbeddingWorker(store: Store, config: Config): () => Promise<void> {
-  let running = false;
-  const tick = async () => {
-    if (running) return;
-    running = true;
-    try {
-      await processPendingEmbeddings(store, config);
-    } catch (error) {
-      console.error(error);
-    } finally {
-      running = false;
-    }
+async function fetchChannelMessage(message: Message, id: string): Promise<Message | null> {
+  const channel = message.channel as Message["channel"] & {
+    messages?: { fetch(id: string): Promise<unknown> };
   };
-  const timer = setInterval(() => void tick(), 15_000);
-  timer.unref?.();
-  void tick();
-  return async () => {
-    clearInterval(timer);
-    while (running) await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
-  };
-}
-
-async function processPendingEmbeddings(store: Store, config: Config): Promise<void> {
-  let model: string;
+  if (!channel.messages || typeof channel.messages.fetch !== "function") return null;
   try {
-    model = embeddingProviderConfig(config).model;
+    const fetched = await channel.messages.fetch(id);
+    return fetched && typeof fetched === "object" ? fetched as Message : null;
   } catch {
-    return;
+    return null;
   }
-  const pending = store.pendingMessageEmbeddings(model, 8);
-  if (!pending.length) return;
-  try {
-    const embeddings = await callEmbeddingProvider(config, pending.map((item) => embeddingDocumentText(item.text)));
-    if (embeddings.length !== pending.length) throw new Error(`embedding_count_mismatch:${embeddings.length}/${pending.length}`);
-    for (let index = 0; index < pending.length; index += 1) {
-      store.saveMessageEmbedding(pending[index].messageId, model, embeddings[index]);
+}
+
+function pureTextMessage(message: Message): boolean {
+  const components = (message as Message & { components?: unknown[] }).components;
+  const embeds = (message as Message & { embeds?: unknown[] }).embeds;
+  const attachments = (message as Message & { attachments?: { size?: number } }).attachments;
+  const attachmentCount = attachments?.size ?? 0;
+  const system = (message as Message & { system?: boolean }).system;
+  return !system && !message.webhookId && !components?.length && !embeds?.length && attachmentCount === 0 && Boolean(message.content?.trim());
+}
+
+function textOnlyPromptRef(message: Message): PromptMessageRef {
+  const ref = promptRefFromDiscordMessage(message);
+  return { ...ref, attachments: undefined, imageUrls: undefined, attachmentExtractions: undefined };
+}
+
+function humanTextMessage(message: Message): boolean {
+  return Boolean(message.content?.trim());
+}
+
+function validHumanTextMessage(message: Message): boolean {
+  return !message.author.bot && !message.webhookId && !message.system &&
+    humanTextMessage(message);
+}
+
+function recentHumanTextMessage(message: Message): boolean {
+  const components = (message as Message & { components?: unknown[] }).components;
+  const embeds = (message as Message & { embeds?: unknown[] }).embeds;
+  const attachments = (message as Message & { attachments?: { size?: number } }).attachments;
+  const system = (message as Message & { system?: boolean }).system;
+  return !message.author.bot && !system && !components?.length && !embeds?.length &&
+    (attachments?.size ?? 0) === 0 && humanTextMessage(message);
+}
+
+async function replyChainPrompt(
+  job: AiJob
+): Promise<{ source?: PromptMessageRef; responses: PromptMessageRef[]; unavailable: boolean }> {
+  const chain = job.trigger.chain;
+  if (!chain) return { responses: [], unavailable: false };
+  const clientUserId = currentClientUserId(job.message);
+  let unavailable = false;
+  const sourceMessage = chain.sourceMessageId
+    ? await fetchChannelMessage(job.message, chain.sourceMessageId)
+    : null;
+  if (!sourceMessage || !validHumanTextMessage(sourceMessage)) unavailable = true;
+  const responseRefs: PromptMessageRef[] = [];
+  for (const id of chain.responseMessageIds) {
+    const response = id === job.trigger.referencedMessage?.id
+      ? job.trigger.referencedMessage
+      : await fetchChannelMessage(job.message, id);
+    if (!response || !response.author.bot || response.author.id !== clientUserId || !pureTextMessage(response)) {
+      unavailable = true;
+      continue;
     }
+    responseRefs.push(textOnlyPromptRef(response));
+  }
+  return {
+    source: sourceMessage && validHumanTextMessage(sourceMessage)
+      ? textOnlyPromptRef(sourceMessage)
+      : undefined,
+    responses: responseRefs,
+    unavailable
+  };
+}
+
+async function recentContext(
+  job: AiJob,
+  route: IntentRoute
+): Promise<{ messages: PromptMessageRef[]; unavailable: boolean }> {
+  if (!route.useRecentContext) return { messages: [], unavailable: false };
+  const channel = job.message.channel as Message["channel"] & {
+    messages?: { fetch(options: { limit: number }): Promise<unknown> };
+  };
+  if (!channel.messages || typeof channel.messages.fetch !== "function") {
+    return { messages: [], unavailable: true };
+  }
+  try {
+    const fetched = await channel.messages.fetch({ limit: job.runtime.recentContextMessages });
+    const values = fetched && typeof fetched === "object" && "values" in fetched
+      ? [...(fetched as { values(): Iterable<Message> }).values()]
+      : Array.isArray(fetched) ? fetched : [];
+    const selected: PromptMessageRef[] = [];
+    const clientUserId = currentClientUserId(job.message);
+    for (const candidate of values) {
+      if (!candidate || candidate.id === job.message.id) continue;
+      if (candidate.author.bot) {
+        if (candidate.author.id !== clientUserId || !pureTextMessage(candidate)) continue;
+        const chain = job.runtimeStore.aiResponseChain(candidate.id);
+        if (!chain || chain.channelId !== job.message.channelId || !chain.responseMessageIds.includes(candidate.id)) continue;
+      } else if (!recentHumanTextMessage(candidate) || candidate.webhookId) {
+        continue;
+      }
+      selected.push(textOnlyPromptRef(candidate));
+    }
+    selected.sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+    return { messages: selected.slice(-job.runtime.recentContextMessages), unavailable: false };
+  } catch {
+    return { messages: [], unavailable: true };
+  }
+}
+function logRequest(store: AiRuntimeStore, input: AiRequestLogInput): number | undefined {
+  try {
+    const id = store.logAiRequest(input);
+    return typeof id === "number" ? id : undefined;
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    for (const item of pending) {
-      store.markMessageEmbeddingFailed(item.messageId, model, message);
-    }
+    console.error(error);
+    return undefined;
   }
 }
 
-export function claimAiRequest(messageId: string, userId: string, at = Date.now()): "duplicate" | "cooldown" | "busy" | null {
-  for (const [id, expiresAt] of recentAiMessageIds) if (expiresAt <= at) recentAiMessageIds.delete(id);
-  for (const [id, expiresAt] of aiUserCooldowns) if (expiresAt <= at) aiUserCooldowns.delete(id);
-  if ((recentAiMessageIds.get(messageId) ?? 0) > at) return "duplicate";
-  recentAiMessageIds.set(messageId, at + AI_MESSAGE_DEDUP_MS);
-  if ((aiUserCooldowns.get(userId) ?? 0) > at) return "cooldown";
-  if (activeAiRequests >= AI_MAX_IN_FLIGHT) return "busy";
-  aiUserCooldowns.set(userId, at + AI_USER_COOLDOWN_MS);
-  activeAiRequests += 1;
-  return null;
+function finishJob(job: AiJob): void {
+  activeJobs.delete(job);
+  if (admittedByUser.get(job.userId) === job) admittedByUser.delete(job.userId);
+  aiUserCooldowns.set(job.userId, Date.now() + job.runtime.cooldownSeconds * 1_000);
+  job.stopTyping();
+  pumpQueue();
 }
 
-export function releaseAiRequest(): void {
-  activeAiRequests = Math.max(0, activeAiRequests - 1);
-}
-
-export function activeAiRequestCount(): number {
-  return activeAiRequests;
-}
-
-export async function handleAiMention(message: Message, client: Client, store: Store, config: Config): Promise<void> {
-  if (!message.guildId || !config.guildIds.includes(message.guildId) || message.author.bot || !client.user) return;
-  if (!message.mentions.users.has(client.user.id)) return;
-  const triggerType = "mention";
-  const referencedMessage = await fetchReferencedMessage(message);
-  const runtime = runtimeSettingsFromStore(store, config);
-  const access = aiAccessForMessage(message, store, config);
-  if (!access.ok) {
-    if (access.reason === "channel") {
-      await message.reply({ content: DISCORD_ERROR_TEXT.channelDisabled, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
-    }
-    if (access.reason === "disabled") {
-      await message.reply({ content: DISCORD_ERROR_TEXT.aiDisabled, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
-    }
-    return;
-  }
-
-  const attachmentError = attachmentLimitError([message, ...(referencedMessage ? [referencedMessage] : [])], runtime.attachmentMaxBytes);
-  if (attachmentError) {
-    await message.reply({ content: attachmentError, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
-    return;
-  }
-
-  const admission = claimAiRequest(message.id, message.author.id);
-  if (admission === "duplicate") return;
-  if (admission === "cooldown") {
-    await message.reply({ content: DISCORD_ERROR_TEXT.cooldown, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
-    return;
-  }
-  if (admission === "busy") {
-    await message.reply({ content: DISCORD_ERROR_TEXT.busy, allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser } });
-    return;
-  }
-
-  const question = stripBotMention(message.content, client.user.id) || "請分析這則訊息。";
-  const stopTyping = startTyping(message);
-  let targetMessage: PromptMessageRef | undefined;
-  let providerResult: {
-    modelAlias: string;
-    latencyMs: number;
-    inputTokens?: number;
-    outputTokens?: number;
-  } | undefined;
-  let successfulStatus = "ok";
+async function executeJob(job: AiJob): Promise<void> {
+  const message = job.message;
+  const runtimeStoreValue = job.runtimeStore;
+  const clientUserId = currentClientUserId(message);
+  const question = (clientUserId ? stripBotMention(message.content, clientUserId) : message.content).trim() || "請分析這則訊息。";
+  const sourceMessageId: string | null = message.id;
+  let providerResult: { content: string; modelAlias: string; latencyMs: number; inputTokens?: number; outputTokens?: number } | undefined;
+  let deliveryCompleted = false;
+  const taskType = job.trigger.triggerType === "reply_to_bot" ? "analyze_reply" : "answer";
+  let contextUnavailable = false;
   try {
-    const askingMessage = await resolvePromptMessageRef(message, store, runtime.attachmentMaxBytes);
-    targetMessage = referencedMessage ? await resolvePromptMessageRef(referencedMessage, store, runtime.attachmentMaxBytes) : undefined;
+    const askingMessage = await resolvePromptMessageRef(message, job.runtime.attachmentMaxBytes);
+    const referenced = job.trigger.referencedMessage;
+    const targetMessage = referenced && job.trigger.triggerType === "mention"
+      ? textOnlyPromptRef(referenced)
+      : undefined;
     const route = regexIntentRoute(question, askingMessage, targetMessage);
-    const memory = await memoryForQuestion(store, config, question, message.channelId, runtime.summaryMessageLimit, [message.id], route);
+    const chainPrompt = await replyChainPrompt(job);
+    contextUnavailable = chainPrompt.unavailable;
+    const recent = await recentContext(job, route);
+    contextUnavailable ||= recent.unavailable;
     const promptMessages = buildMentionMessages({
       question,
       askingMessage,
       targetMessage,
-      memory,
+      replyContext: job.trigger.triggerType === "reply_to_bot" ? chainPrompt : undefined,
+      recentContext: recent.messages,
       useSpoilerWarning: route.useSpoiler
     });
-    const chatResult = await callAiProvider(store, config, promptMessages);
-    providerResult = chatResult;
-    await replyDiscordChunks(message, chatResult.content, runtime.replyMentionUser);
-    store.logAiRequest({
+    providerResult = await callAiProvider(job.store, job.config, promptMessages);
+    let content = providerResult.content;
+    if (contextUnavailable) {
+      content = "部分近期對話無法取得（AI-CONTEXT-001），以下根據目前可取得上下文回答。\n\n" + content;
+    }
+    const responseMessageIds = await replyDiscordChunks(message, content, job.runtime.replyMentionUser, job.runtime.responseMaxChars);
+    deliveryCompleted = true;
+    const requestLogId = logRequest(runtimeStoreValue, {
       actorId: message.author.id,
       channelId: message.channelId,
-      sourceMessageId: targetMessage?.id ?? message.id,
-      triggerType,
-      taskType: targetMessage ? "analyze_reply" : "answer",
+      sourceMessageId,
+      triggerType: job.trigger.triggerType,
+      taskType,
       modelAlias: providerResult.modelAlias,
-      status: successfulStatus,
+      status: "ok",
+      errorType: contextUnavailable ? "ai_context_unavailable" : undefined,
       latencyMs: providerResult.latencyMs,
       inputTokens: providerResult.inputTokens,
       outputTokens: providerResult.outputTokens
     });
+    if (requestLogId === undefined) {
+      console.error("ai_response_metadata_failed");
+      return;
+    }
+    if (responseMessageIds.length) {
+      runtimeStoreValue.recordAiResponseMessages(requestLogId, responseMessageIds);
+    }
   } catch (error) {
     if (providerResult) {
-      store.logAiRequest({
+      if (!deliveryCompleted) logRequest(runtimeStoreValue, {
         actorId: message.author.id,
         channelId: message.channelId,
-        sourceMessageId: targetMessage?.id ?? message.id,
-        triggerType,
-        taskType: targetMessage ? "analyze_reply" : "answer",
+        sourceMessageId,
+        triggerType: job.trigger.triggerType,
+        taskType,
         modelAlias: providerResult.modelAlias,
         status: "delivery_error",
         errorType: "discord_delivery_failed",
@@ -299,26 +438,152 @@ export async function handleAiMention(message: Message, client: Client, store: S
         inputTokens: providerResult.inputTokens,
         outputTokens: providerResult.outputTokens
       });
+      else console.error("ai_response_metadata_failed");
       console.error(error);
       return;
     }
     const normalized = aiError(error);
-    store.logAiRequest({
+    logRequest(runtimeStoreValue, {
       actorId: message.author.id,
       channelId: message.channelId,
-      sourceMessageId: targetMessage?.id ?? message.id,
-      triggerType,
-      taskType: targetMessage ? "analyze_reply" : "answer",
-      modelAlias: store.setting("ai_model") ?? config.aiModel,
+      sourceMessageId,
+      triggerType: job.trigger.triggerType,
+      taskType,
+      modelAlias: modelAlias(job.store, job.config),
       status: "error",
       errorType: normalized.logType
     });
-    await message.reply({
-      content: DISCORD_ERROR_TEXT.aiUnavailable(normalized.userCode),
-      allowedMentions: { parse: [], repliedUser: runtime.replyMentionUser }
-    });
-  } finally {
-    releaseAiRequest();
-    stopTyping();
+    await safeReply(message, DISCORD_ERROR_TEXT.aiUnavailable(normalized.userCode), job.runtime);
   }
+}
+async function runJob(job: AiJob): Promise<void> {
+  activeJobs.add(job);
+  try {
+    await executeJob(job);
+  } finally {
+    finishJob(job);
+  }
+}
+
+function pumpQueue(): void {
+  if (aiRuntimeStopped) return;
+  while (queuedJobs.length) {
+    const next = queuedJobs[0];
+    if (activeJobs.size >= next.runtime.maxInFlight) break;
+    queuedJobs.shift();
+    if (next.queuedTimer) clearTimeout(next.queuedTimer);
+    void runJob(next);
+  }
+}
+
+function expireQueuedJob(job: AiJob): void {
+  const index = queuedJobs.indexOf(job);
+  if (index < 0) return;
+  queuedJobs.splice(index, 1);
+  if (admittedByUser.get(job.userId) === job) admittedByUser.delete(job.userId);
+  aiUserCooldowns.set(job.userId, Date.now() + job.runtime.cooldownSeconds * 1_000);
+  job.stopTyping();
+  void safeReply(job.message, queueTimeoutText(), job.runtime);
+  pumpQueue();
+}
+
+function admitJob(job: AiJob): "duplicate" | "cooldown" | "same_user" | "queue_full" | "running" | "queued" | "stopped" {
+  const now = Date.now();
+  if (aiRuntimeStopped) return "stopped";
+  cleanupAdmissionMaps(now);
+  if ((recentAiMessageIds.get(job.message.id) ?? 0) > now) return "duplicate";
+  if ((aiUserCooldowns.get(job.userId) ?? 0) > now) return "cooldown";
+  if (admittedByUser.has(job.userId)) return "same_user";
+  if (activeJobs.size < job.runtime.maxInFlight) {
+    recentAiMessageIds.set(job.message.id, now + AI_MESSAGE_DEDUP_MS);
+    admittedByUser.set(job.userId, job);
+    return "running";
+  }
+  if (queuedJobs.length >= job.runtime.queueMax) return "queue_full";
+  recentAiMessageIds.set(job.message.id, now + AI_MESSAGE_DEDUP_MS);
+  admittedByUser.set(job.userId, job);
+  queuedJobs.push(job);
+  job.queuedTimer = setTimeout(() => expireQueuedJob(job), job.runtime.queueTimeoutSeconds * 1_000);
+  return "queued";
+}
+
+export async function handleAiMessage(message: Message, store: Store, config: Config): Promise<void> {
+  if (aiRuntimeStopped || !message.guildId || !config.guildIds.includes(message.guildId) ||
+      message.author.bot || message.webhookId || message.system) return;
+  const runtimeStoreValue = runtimeStore(store);
+  const trigger = await detectTrigger(message, runtimeStoreValue);
+  if (!trigger) return;
+  if (aiRuntimeStopped) return;
+  const runtime = runtimeSettingsFromStore(store, config);
+  const access = aiAccessForMessage(message, store, config);
+  if (!access.ok) {
+    if (access.reason === "channel") await safeReply(message, DISCORD_ERROR_TEXT.channelDisabled, runtime);
+    if (access.reason === "disabled") await safeReply(message, DISCORD_ERROR_TEXT.aiDisabled, runtime);
+    return;
+  }
+  const attachmentError = attachmentLimitError(
+    [message],
+    runtime.attachmentMaxBytes
+  );
+  if (attachmentError) {
+    await safeReply(message, attachmentError, runtime);
+    return;
+  }
+  const job: AiJob = {
+    message,
+    store,
+    runtimeStore: runtimeStoreValue,
+    config,
+    runtime,
+    trigger,
+    userId: message.author.id,
+    stopTyping: () => undefined
+  };
+  const admission = admitJob(job);
+  if (admission === "duplicate") {
+    job.stopTyping();
+    return;
+  }
+  if (admission === "cooldown") {
+    job.stopTyping();
+    await safeReply(message, cooldownText(), runtime);
+    return;
+  }
+  if (admission === "same_user") {
+    job.stopTyping();
+    await safeReply(message, sameUserText(), runtime);
+    return;
+  }
+  if (admission === "queue_full") {
+    job.stopTyping();
+    await safeReply(message, queueFullText(), runtime);
+    return;
+  }
+  if (admission === "stopped") {
+    job.stopTyping();
+    return;
+  }
+  job.stopTyping = startTyping(message);
+  if (admission === "running") {
+    void runJob(job);
+  } else {
+    pumpQueue();
+  }
+}
+
+export async function stopAiRuntime(): Promise<void> {
+  if (aiRuntimeStopped) return;
+  aiRuntimeStopped = true;
+  const pending = queuedJobs.splice(0);
+  await Promise.all(pending.map(async (job) => {
+    if (job.queuedTimer) clearTimeout(job.queuedTimer);
+    if (admittedByUser.get(job.userId) === job) admittedByUser.delete(job.userId);
+    aiUserCooldowns.set(job.userId, Date.now() + job.runtime.cooldownSeconds * 1_000);
+    job.stopTyping();
+    await safeReply(job.message, queueShutdownText(), job.runtime);
+  }));
+}
+
+export function activeAiRequestCount(): number {
+  return activeJobs.size;
 }

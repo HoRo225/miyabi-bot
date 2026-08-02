@@ -13,17 +13,11 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   activeAiRequestCount,
-  handleAiMention,
-  startEmbeddingWorker
+  handleAiMessage,
+  stopAiRuntime
 } from "./ai-message-runtime.js";
-import { runBackfillJob } from "./backfill-runtime.js";
 import { loadConfig, type Config } from "./config.js";
 import { handleInteraction } from "./control-panel-interactions.js";
-import {
-  forgetDiscordMessage,
-  rememberDiscordMessage,
-  rememberUpdatedDiscordMessage
-} from "./discord-message-runtime.js";
 import { startSteamFreeWorker } from "./steam-free-runtime.js";
 import { Store } from "./store.js";
 import { DISCORD_ERROR_TEXT } from "./text.js";
@@ -97,17 +91,12 @@ async function main(): Promise<void> {
   });
   let acceptingEvents = true;
   let stopHealth: () => void = () => undefined;
-  let stopEmbeddings: () => Promise<void> = async () => undefined;
 
   client.once(Events.ClientReady, (readyClient) => {
     console.log(`Logged in as ${readyClient.user.tag}`);
     stopHealth = startHealthHeartbeat(readyClient, healthAlerts);
-    stopEmbeddings = startEmbeddingWorker(store, config);
     startSteamFreeWorker(readyClient, store);
     cleanupKnownTempVoiceChannels(readyClient, store).catch(console.error);
-    for (const jobId of store.activeBackfillJobIds()) {
-      runBackfillJob(readyClient, store, jobId).catch(console.error);
-    }
   });
   client.on(Events.InteractionCreate, (interaction) => {
     if (!acceptingEvents || !interaction.guildId || !config.guildIds.includes(interaction.guildId)) return;
@@ -120,34 +109,7 @@ async function main(): Promise<void> {
   });
   client.on(Events.MessageCreate, (message) => {
     if (!acceptingEvents || !message.guildId || !config.guildIds.includes(message.guildId)) return;
-    try {
-      rememberDiscordMessage(message, store);
-    } catch (error) {
-      console.error(error);
-    }
-    handleAiMention(message, client, store, config).catch(console.error);
-  });
-  client.on(Events.MessageUpdate, (_oldMessage, newMessage) => {
-    if (!acceptingEvents || !newMessage.guildId || !config.guildIds.includes(newMessage.guildId)) return;
-    rememberUpdatedDiscordMessage(newMessage, store).catch(console.error);
-  });
-  client.on(Events.MessageDelete, (message) => {
-    if (!acceptingEvents || !message.guildId || !config.guildIds.includes(message.guildId)) return;
-    try {
-      forgetDiscordMessage(message, store);
-    } catch (error) {
-      console.error(error);
-    }
-  });
-  client.on(Events.MessageBulkDelete, (messages) => {
-    for (const message of messages.values()) {
-      if (!acceptingEvents || !message.guildId || !config.guildIds.includes(message.guildId)) continue;
-      try {
-        forgetDiscordMessage(message, store);
-      } catch (error) {
-        console.error(error);
-      }
-    }
+    handleAiMessage(message, store, config).catch(console.error);
   });
   client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     if (!acceptingEvents || !config.guildIds.includes(newState.guild.id)) return;
@@ -158,13 +120,17 @@ async function main(): Promise<void> {
     if (!acceptingEvents) return;
     acceptingEvents = false;
     stopHealth();
-    await stopEmbeddings();
-    client.destroy();
-    const deadline = Date.now() + 10_000;
+    await stopAiRuntime();
+    const deadline = Date.now() + 35_000;
     while (activeAiRequestCount() > 0 && Date.now() < deadline) {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
     }
-    store.close();
+    client.destroy();
+    if (activeAiRequestCount() === 0) {
+      store.close();
+    } else {
+      console.error("AI requests still active; leaving store open for graceful completion");
+    }
   };
   process.once("SIGTERM", () => void shutdown());
   process.once("SIGINT", () => void shutdown());
