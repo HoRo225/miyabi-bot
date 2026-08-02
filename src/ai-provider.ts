@@ -52,9 +52,6 @@ type OpenAiChatResponse = {
   };
 };
 
-type OpenAiEmbeddingsResponse = {
-  data?: Array<{ index?: unknown; embedding?: unknown }>;
-};
 
 export type AiModelOption = {
   label: string;
@@ -70,20 +67,6 @@ type OpenAiStreamChunk = {
   usage?: OpenAiChatResponse["usage"];
 };
 
-export function parseOpenAiEmbeddingsResponse(body: unknown): number[][] {
-  const data = (body as OpenAiEmbeddingsResponse | null)?.data;
-  if (!Array.isArray(data)) return [];
-  return data
-    .map((row, fallbackIndex) => ({
-      index: typeof row.index === "number" && Number.isInteger(row.index) ? row.index : fallbackIndex,
-      embedding: Array.isArray(row.embedding) && row.embedding.every((item) => typeof item === "number" && Number.isFinite(item))
-        ? row.embedding
-        : []
-    }))
-    .filter((row) => row.embedding.length)
-    .sort((left, right) => left.index - right.index)
-    .map((row) => row.embedding);
-}
 
 export function parseModelOptionsFromModelsResponse(body: unknown): AiModelOption[] {
   const data = (body as { data?: unknown } | null)?.data;

@@ -1,7 +1,6 @@
 import {
   parseModelOptionsFromModelsResponse,
   parseOpenAiChatResponseText,
-  parseOpenAiEmbeddingsResponse,
   parseToolCalls,
   type AiProviderMessage,
   type AiProviderTool,
@@ -43,45 +42,6 @@ class AiServiceError extends Error {
   }
 }
 
-export function embeddingProviderConfig(config: Config): { baseUrl: string; apiKey: string; model: string } {
-  const baseUrl = openAiBaseUrl(config.aiBaseUrl);
-  const apiKey = config.aiApiKey;
-  const model = config.aiEmbeddingModel;
-  if (!apiKey) throw new AiServiceError("AI-PROVIDER-001", "missing_ai_api_key", "AI provider API key is missing");
-  if (!model) throw new AiServiceError("AI-PROVIDER-001", "missing_ai_embedding_model", "AI embedding model is missing");
-  return { baseUrl, apiKey, model };
-}
-
-export function embeddingDocumentText(text: string): string {
-  return `title: discord message | text: ${text.replace(/\s+/g, " ").trim().slice(0, 12_000)}`;
-}
-
-export function embeddingQueryText(text: string): string {
-  return `task: question answering | query: ${text.replace(/\s+/g, " ").trim().slice(0, 2_000)}`;
-}
-
-export async function callEmbeddingProvider(config: Config, inputs: string[]): Promise<number[][]> {
-  const { baseUrl, apiKey, model } = embeddingProviderConfig(config);
-  const response = await fetch(`${baseUrl}/embeddings`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${apiKey}`
-    },
-    body: JSON.stringify({ model, input: inputs, encoding_format: "float" }),
-    signal: AbortSignal.timeout(20_000)
-  });
-  if (!response.ok) {
-    throw new AiServiceError("AI-PROVIDER-001", `ai_embedding_http_${response.status}`, `AI embedding provider returned HTTP ${response.status}`);
-  }
-  try {
-    return parseOpenAiEmbeddingsResponse(JSON.parse(await readProviderResponseText(response)));
-  } catch (error) {
-    if (error instanceof AiServiceError) throw error;
-    throw new AiServiceError("AI-PROVIDER-001", "ai_embedding_invalid_response", "AI embedding provider returned an invalid response");
-  }
-}
-
 export async function fetchAiModelOptions(config: Pick<Config, "aiBaseUrl" | "aiApiKey">): Promise<AiModelOption[]> {
   const normalizedBaseUrl = openAiBaseUrl(config.aiBaseUrl);
   const response = await fetch(`${normalizedBaseUrl}/models`, {
@@ -114,7 +74,7 @@ export async function callAiProviderTurn(
   messages: AiProviderMessage[],
   tools: AiProviderTool[] = []
 ): Promise<AiProviderTurnResult> {
-  const model = store.setting("ai_model") ?? config.aiModel;
+  const model = store.setting("ai_model")?.trim() || config.aiModel.trim() || "gemini/gemini-3.6-flash";
   const baseUrl = openAiBaseUrl(config.aiBaseUrl);
   const apiKey = config.aiApiKey;
   if (!apiKey) {
@@ -122,6 +82,9 @@ export async function callAiProviderTurn(
   }
   if (!model) {
     throw new AiServiceError("AI-PROVIDER-001", "missing_ai_model", "AI provider model is missing");
+  }
+  if (isNonEmptyAssistantPrefill(messages)) {
+    throw new AiServiceError("AI-LLM-002", "assistant_prefill_not_allowed", "Assistant prefill is not allowed");
   }
 
   const started = Date.now();
@@ -136,7 +99,6 @@ export async function callAiProviderTurn(
       body: JSON.stringify({
         model,
         messages,
-        temperature: 0.2,
         max_tokens: 2_000,
         ...(tools.length ? { tools, tool_choice: "auto", parallel_tool_calls: false } : {})
       }),
@@ -177,6 +139,21 @@ export async function callAiProviderTurn(
 
 function numberOrUndefined(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function isNonEmptyAssistantPrefill(messages: AiProviderMessage[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const hasToolCalls = Boolean(message.tool_calls?.length);
+    const hasContent = typeof message.content === "string"
+      ? message.content.trim().length > 0
+      : Array.isArray(message.content) && message.content.some((part) =>
+        part.type === "text" ? part.text.trim().length > 0 : true
+      );
+    if (!hasContent && !hasToolCalls) continue;
+    return message.role === "assistant";
+  }
+  return false;
 }
 
 export function aiError(error: unknown): AiServiceError {

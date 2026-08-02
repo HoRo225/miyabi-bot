@@ -5,12 +5,12 @@ import { join } from "node:path";
 import test from "node:test";
 import type { Interaction, Message } from "discord.js";
 import { parseModelOptionsFromModelsResponse } from "./ai-provider.js";
-import { aiError, callAiProvider, callAiProviderTurn, embeddingProviderConfig, fetchAiModelOptions } from "./ai-service.js";
+import { aiError, callAiProvider, callAiProviderTurn, fetchAiModelOptions } from "./ai-service.js";
 import type { Config } from "./config.js";
 import { aiModelSelectPanelUpdate, aiProviderStatusPanelUpdate, aiSettingsPanelMessage } from "./control-panels.js";
 import { roleSelect } from "./discord-ui.js";
 import { discordAttachmentUrl } from "./guards.js";
-import { resolvePromptMessageRef } from "./prompt-message-ref.js";
+import { attachmentLimitError, resolvePromptMessageRef } from "./prompt-message-ref.js";
 import { Store } from "./store.js";
 
 const config: Config = {
@@ -25,19 +25,9 @@ const config: Config = {
   aiBaseUrl: "https://provider.example",
   aiApiKey: "env-key",
   aiModel: "env-model",
-  aiEmbeddingModel: "env-embedding",
-  summaryMessageLimit: 50,
   replyMentionUser: true,
-  attachmentMaxBytes: 1024
 };
 
-test("AI provider credentials only come from environment config", () => {
-  assert.deepEqual(embeddingProviderConfig(config), {
-    baseUrl: "https://provider.example/v1",
-    apiKey: "env-key",
-    model: "env-embedding"
-  });
-});
 
 test("chat requests use env credentials, max_tokens, and a 1 MiB response cap", async () => {
   const originalFetch = globalThis.fetch;
@@ -64,6 +54,11 @@ test("chat requests use env credentials, max_tokens, and a 1 MiB response cap", 
     assert.equal(authorization, "Bearer env-key");
     assert.equal(requestBody.model, "selected-model");
     assert.equal(requestBody.max_tokens, 2_000);
+    assert.equal("temperature" in requestBody, false);
+    assert.equal("top_p" in requestBody, false);
+    assert.equal("top_k" in requestBody, false);
+    assert.equal("presence_penalty" in requestBody, false);
+    assert.equal("frequency_penalty" in requestBody, false);
 
     globalThis.fetch = (async () => new Response("{}", {
       headers: { "content-length": String(1024 * 1024 + 1) }
@@ -104,6 +99,53 @@ test("provider failures expose only fixed error categories", async () => {
       () => callAiProvider({ setting: () => "model" }, config, [{ role: "user", content: "ping" }]),
       (error: unknown) => aiError(error).logType === "ai_provider_request_failed"
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider rejects non-empty assistant prefill before network call", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  try {
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "unexpected" } }] }), {
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+    await assert.rejects(
+      () => callAiProviderTurn({ setting: () => "model" }, config, [
+        { role: "user", content: "question" },
+        { role: "assistant", content: "prefilled answer" }
+      ]),
+      (error: unknown) => aiError(error).logType === "assistant_prefill_not_allowed"
+    );
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("provider rejects assistant prefill before trailing empty user turn", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  try {
+    globalThis.fetch = (async () => {
+      fetchCount += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: "unexpected" } }] }), {
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+    await assert.rejects(
+      () => callAiProviderTurn({ setting: () => "model" }, config, [
+        { role: "user", content: "question" },
+        { role: "assistant", content: "prefilled answer" },
+        { role: "user", content: "   " }
+      ]),
+      (error: unknown) => aiError(error).logType === "assistant_prefill_not_allowed"
+    );
+    assert.equal(fetchCount, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -175,6 +217,19 @@ test("attachment URLs only allow HTTPS Discord CDN hosts", () => {
   assert.deepEqual(discordAttachmentUrl("https://example.com/file.txt"), { ok: false, errorType: "blocked_host" });
 });
 
+test("unsupported text attachment URL returns fixed guard error", () => {
+  const message = {
+    attachments: new Map([["attachment", {
+      id: "attachment",
+      name: "notes.txt",
+      contentType: "text/plain",
+      size: 5,
+      url: "https://example.com/notes.txt"
+    }]])
+  } as unknown as Message;
+  assert.match(attachmentLimitError([message], 128 * 1024) ?? "", /AI-ATTACHMENT-001/);
+});
+
 test("ordinary message URLs are never fetched", async () => {
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -192,10 +247,7 @@ test("ordinary message URLs are never fetched", async () => {
       url: "https://discord.com/channels/guild/channel/message",
       attachments: new Map()
     } as unknown as Message;
-    const ref = await resolvePromptMessageRef(message, {
-      listMemoryChannels: () => [],
-      saveAttachmentExtraction: () => undefined
-    }, 128 * 1024);
+    const ref = await resolvePromptMessageRef(message, 128 * 1024);
     assert.equal(fetchCount, 0);
     assert.equal(ref.content, "請看 https://example.com/private");
   } finally {
@@ -203,7 +255,7 @@ test("ordinary message URLs are never fetched", async () => {
   }
 });
 
-test("text attachments allow one Discord CDN redirect, enforce 128 KiB, and only persist in memory channels", async () => {
+test("text attachments allow one Discord CDN redirect and enforce 128 KiB without persistence", async () => {
   const originalFetch = globalThis.fetch;
   const attachment = {
     id: "attachment",
@@ -222,7 +274,6 @@ test("text attachments allow one Discord CDN redirect, enforce 128 KiB, and only
     attachments: new Map([[attachment.id, attachment]])
   } as unknown as Message;
   let fetchCount = 0;
-  let saved = 0;
   try {
     globalThis.fetch = (async () => {
       fetchCount += 1;
@@ -230,25 +281,15 @@ test("text attachments allow one Discord CDN redirect, enforce 128 KiB, and only
         ? new Response(null, { status: 302, headers: { location: "https://media.discordapp.net/attachments/notes.txt" } })
         : new Response("hello", { headers: { "content-length": "5" } });
     }) as typeof fetch;
-    const disabledStore: Parameters<typeof resolvePromptMessageRef>[1] = {
-      listMemoryChannels: () => [],
-      saveAttachmentExtraction: () => { saved += 1; }
-    };
-    const ref = await resolvePromptMessageRef(message, disabledStore, 128 * 1024);
+    const ref = await resolvePromptMessageRef(message, 128 * 1024);
     assert.equal(fetchCount, 2);
     assert.deepEqual(ref.attachmentExtractions, ["notes.txt:\nhello"]);
-    assert.equal(saved, 0);
 
     globalThis.fetch = (async () => new Response("too large", {
       headers: { "content-length": String(128 * 1024 + 1) }
     })) as typeof fetch;
-    const enabledStore: Parameters<typeof resolvePromptMessageRef>[1] = {
-      listMemoryChannels: () => ["channel"],
-      saveAttachmentExtraction: () => { saved += 1; }
-    };
-    const oversized = await resolvePromptMessageRef(message, enabledStore, 128 * 1024);
+    const oversized = await resolvePromptMessageRef(message, 128 * 1024);
     assert.equal(oversized.attachmentExtractions, undefined);
-    assert.equal(saved, 0);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -266,7 +307,7 @@ test("AI settings panel only exposes 9router controls", () => {
     listSettingsAllowedRoles: () => [],
     voiceSettings: () => ({}) as never,
     steamFreeSettings: () => ({}) as never,
-    adminStats: () => ({ messages: 0, attachments: 0, aiRequestLogs: 0, auditLogs: 0 })
+    adminStats: () => ({ aiRequestLogs: 0, aiResponseMessages: 0, auditLogs: 0, allowedChannels: 0, allowedRoles: 0, settingsRoles: 0 })
   };
   const panel = JSON.stringify(aiSettingsPanelMessage({} as Interaction, store, {
     ...config,

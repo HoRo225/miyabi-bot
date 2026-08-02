@@ -28,7 +28,6 @@ import {
 } from "./control-panels.js";
 import type { PanelMessage, PanelUpdate } from "./discord-ui.js";
 import { memberRoleIds } from "./discord-message-runtime.js";
-import { selectedIdChanges } from "./memory.js";
 import { canUseSettings } from "./permissions.js";
 import {
   checkSteamFreeGames,
@@ -38,6 +37,16 @@ import type { Store } from "./store.js";
 import { DISCORD_ERROR_TEXT, safeMentions } from "./text.js";
 import { normalizeVoiceNameTemplate } from "./voice.js";
 import { readNineRouterKeyState } from "./nine-router-keys.js";
+
+export function selectedIdChanges(existingIds: string[], selectedIds: string[]): { add: string[]; remove: string[] } {
+  const selected = new Set(selectedIds);
+  const existing = new Set(existingIds);
+  return {
+    add: selectedIds.filter((id) => !existing.has(id)),
+    remove: existingIds.filter((id) => !selected.has(id))
+  };
+}
+
 type PanelInteraction = {
   user: { id: string };
   message?: { id: string } | null;
@@ -318,8 +327,16 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
       return true;
     }
     const changes = selectedIdChanges(current, interaction.values);
-    for (const id of changes.add) store.addSettingsRole(id, actor);
+    const nextCount = current.length - changes.remove.length + changes.add.length;
+    if (nextCount > 25) {
+      await interaction.reply({
+        content: "設定角色最多只能保留 25 個，請先取消部分選取。",
+        flags: MessageFlags.Ephemeral
+      });
+      return true;
+    }
     for (const id of changes.remove) store.removeSettingsRole(id, actor);
+    for (const id of changes.add) store.addSettingsRole(id, actor);
     await interaction.update(adminPanelUpdate(interaction, store, config, "settings"));
     return true;
   }

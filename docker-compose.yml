@@ -55,10 +55,7 @@ services:
       AI_BASE_URL: ${AI_BASE_URL:-http://9router:20128}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_MODEL: ${AI_MODEL:-}
-      AI_EMBEDDING_MODEL: ${AI_EMBEDDING_MODEL:-gemini/gemini-embedding-2-preview}
-      DEFAULT_SUMMARY_MESSAGE_LIMIT: ${DEFAULT_SUMMARY_MESSAGE_LIMIT:-50}
       REPLY_MENTION_USER: ${REPLY_MENTION_USER:-true}
-      ATTACHMENT_MAX_MB: ${ATTACHMENT_MAX_MB:-10}
     depends_on:
       9router:
         condition: service_healthy
