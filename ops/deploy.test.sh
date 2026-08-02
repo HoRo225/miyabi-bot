@@ -84,7 +84,11 @@ mock_docker() {
       esac
       ;;
     image)
-      mock_log "image $*"
+      case "$2" in
+        ls) printf '%s\n' "$MOCK_CANDIDATE" "$MOCK_CURRENT" "$MOCK_STALE" ;;
+        rm) mock_log "image rm $3" ;;
+        *) exit 2 ;;
+      esac
       ;;
     *) exit 2 ;;
   esac
@@ -107,6 +111,7 @@ sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 other_sha='cccccccccccccccccccccccccccccccccccccccc'
 current='miyabi-bot:git-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 candidate="miyabi-bot:git-$sha"
+stale='miyabi-bot:git-dddddddddddddddddddddddddddddddddddddddd'
 
 write_env() {
   image="${1:-$current}"
@@ -133,6 +138,7 @@ run_deploy() {
   MOCK_MV_FAIL="${MOCK_MV_FAIL:-0}" \
   MOCK_CURRENT="$current" \
   MOCK_CANDIDATE="$candidate" \
+  MOCK_STALE="$stale" \
   MOCK_EXPECT_DB="${MOCK_EXPECT_DB:-}" \
   ROOT_DIR="$test_root" \
   STATE_DIR="$test_root/state" \
@@ -241,6 +247,11 @@ fi
 grep -qx 'before-mv-fail' "$test_root/data/bot.sqlite"
 grep -qx "BOT_IMAGE=$current" "$test_root/.env"
 [ "$(stat -c '%a' "$test_root/.env")" = 600 ]
+[ "$(cat "$test_root/active-image")" = "$current" ]
+candidate_line="$(line_of "up image=$candidate")"
+current_line="$(line_of "up image=$current")"
+[ -n "$candidate_line" ] && [ -n "$current_line" ]
+[ "$candidate_line" -lt "$current_line" ]
 assert_no_env_temp
 
 write_env
@@ -267,6 +278,9 @@ grep -q "build --build-arg VCS_REF=$sha -t $candidate ." "$test_root/mock.log"
 backup_line="$(line_of backup)"
 candidate_line="$(line_of "up image=$candidate")"
 [ "$backup_line" -lt "$candidate_line" ]
+grep -qx "image rm $stale" "$test_root/mock.log"
+! grep -qx "image rm $current" "$test_root/mock.log"
+! grep -qx "image rm $candidate" "$test_root/mock.log"
 assert_no_env_temp
 
 echo ok
