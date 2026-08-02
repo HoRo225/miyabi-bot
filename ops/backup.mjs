@@ -6,7 +6,7 @@ const databasePath = process.env.DATABASE_PATH ?? "/app/data/bot.sqlite";
 const backupDir = process.env.BACKUP_DIR ?? "/backups";
 const statusDir = process.env.STATUS_DIR ?? "/app/data/status";
 const statusPath = process.env.STATUS_PATH ?? join(statusDir, "backup.json");
-const keep = Math.max(1, Number.parseInt(process.env.BACKUP_KEEP ?? "5", 10) || 5);
+const keep = Math.max(1, Number.parseInt(process.env.BACKUP_KEEP ?? "7", 10) || 7);
 const backupErrorCode = "BACKUP-001";
 
 const timestamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z").replaceAll(/[-:]/g, "");

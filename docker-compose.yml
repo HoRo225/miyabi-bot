@@ -2,10 +2,11 @@ name: horo-discord-bot
 
 services:
   9router:
-    image: decolua/9router:0.5.12@sha256:4927f39da33ce7fc7fdb72c6b173a62397bfa3a4140382e417e44a266ca922a4
+    # 9router v0.5.45; OCI revision 6fcd27337a7893642c7fe630840d0a641743f28f; linux/amd64 child digest.
+    image: decolua/9router@sha256:7b264fd1925717425e9dc01d33bea75621aa7d77684e66758bceeb8463f95fe9
     restart: unless-stopped
     ports:
-      - "${NINE_ROUTER_BIND_ADDRESS:-127.0.0.1}:20128:20128"
+      - "127.0.0.1:20128:20128"
     environment:
       DATA_DIR: /app/data
       PORT: "20128"
@@ -13,6 +14,7 @@ services:
       NODE_ENV: production
       BASE_URL: http://127.0.0.1:20128
       ENABLE_REQUEST_LOGS: "false"
+      OBSERVABILITY_ENABLED: "false"
       JWT_SECRET: ${NINE_ROUTER_JWT_SECRET:?set NINE_ROUTER_JWT_SECRET in .env}
       API_KEY_SECRET: ${NINE_ROUTER_API_KEY_SECRET:?set NINE_ROUTER_API_KEY_SECRET in .env}
       MACHINE_ID_SALT: ${NINE_ROUTER_MACHINE_ID_SALT:?set NINE_ROUTER_MACHINE_ID_SALT in .env}
@@ -87,7 +89,7 @@ services:
     environment:
       DATABASE_PATH: /app/data/bot.sqlite
       BACKUP_DIR: /backups
-      BACKUP_KEEP: "${BACKUP_KEEP:-5}"
+      BACKUP_KEEP: "${BACKUP_KEEP:-7}"
       STATUS_DIR: /app/data/status
     volumes:
       - ./data:/app/data:ro
@@ -102,3 +104,4 @@ services:
 
 volumes:
   9router-data:
+    name: horo-discord-bot_9router-v0545
