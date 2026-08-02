@@ -1,5 +1,4 @@
 .env
-.monitor.env
 backups/
 data/
 dist/

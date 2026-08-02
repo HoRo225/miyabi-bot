@@ -12,4 +12,3 @@ npm-debug.log*
 *.pem
 server_192.168.1.107_ed25519*
 .git/
-.agents/

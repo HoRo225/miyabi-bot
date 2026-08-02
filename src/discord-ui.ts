@@ -76,26 +76,6 @@ export function roleSelect(customId: string, placeholder: string, defaultIds: st
   };
 }
 
-export function channelSelect(customId: string, placeholder: string, defaultIds: string[] = [], disabled = false): ComponentJson {
-  const defaults = defaultIds.slice(0, 25).map((id) => ({ id, type: "channel" }));
-  return {
-    type: ComponentType.ChannelSelect,
-    custom_id: customId,
-    ...(placeholder ? { placeholder } : {}),
-    min_values: 0,
-    max_values: 25,
-    disabled,
-    channel_types: [
-      ChannelType.GuildText,
-      ChannelType.GuildAnnouncement,
-      ChannelType.GuildForum,
-      ChannelType.PublicThread,
-      ChannelType.PrivateThread
-    ],
-    ...(defaults.length ? { default_values: defaults } : {})
-  };
-}
-
 export function notificationChannelSelect(customId: string, placeholder: string, defaultId: string | null = null): ComponentJson {
   return {
     type: ComponentType.ChannelSelect,
