@@ -11,6 +11,19 @@ exec 9>"$state_dir/miyabi-deploy.lock"
 flock -n 9 || { echo "deployment already running" >&2; exit 1; }
 env_snapshot=
 env_temp=
+if [ "${RUNTIME_UID+x}" != "${RUNTIME_GID+x}" ]; then
+  echo "runtime uid/gid overrides must be provided together" >&2
+  exit 1
+fi
+runtime_uid="${RUNTIME_UID-1000}"
+runtime_gid="${RUNTIME_GID-1000}"
+
+case "$runtime_uid" in
+  ''|*[!0-9]*) echo "runtime uid override must be a non-empty decimal" >&2; exit 1 ;;
+esac
+case "$runtime_gid" in
+  ''|*[!0-9]*) echo "runtime gid override must be a non-empty decimal" >&2; exit 1 ;;
+esac
 
 cleanup() {
   [ -z "$env_snapshot" ] || rm -f "$env_snapshot"
@@ -26,14 +39,14 @@ prepare_status_dir() {
   [ ! -L "$status_dir" ] || { echo "data/status must not be a symlink" >&2; return 1; }
   mkdir -p "$status_dir"
   chmod 700 "$status_dir"
-  if [ "$(id -u)" -ne 1000 ] || [ "$(id -g)" -ne 1000 ]; then
-    chown 1000:1000 "$status_dir" || {
-      echo "data/status owner must be runtime uid 1000" >&2
+  if [ "$(id -u)" -ne "$runtime_uid" ] || [ "$(id -g)" -ne "$runtime_gid" ]; then
+    chown "$runtime_uid:$runtime_gid" "$status_dir" || {
+      echo "data/status owner must match runtime uid/gid" >&2
       return 1
     }
   fi
-  [ "$(stat -c '%u:%g' "$status_dir")" = 1000:1000 ] || {
-    echo "data/status owner must be runtime uid 1000" >&2
+  [ "$(stat -c '%u:%g' "$status_dir")" = "$runtime_uid:$runtime_gid" ] || {
+    echo "data/status owner must match runtime uid/gid" >&2
     return 1
   }
 }

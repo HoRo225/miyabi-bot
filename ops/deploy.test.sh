@@ -112,6 +112,8 @@ other_sha='cccccccccccccccccccccccccccccccccccccccc'
 current='miyabi-bot:git-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 candidate="miyabi-bot:git-$sha"
 stale='miyabi-bot:git-dddddddddddddddddddddddddddddddddddddddd'
+test_runtime_uid="$(id -u)"
+test_runtime_gid="$(id -g)"
 
 write_env() {
   image="${1:-$current}"
@@ -141,6 +143,8 @@ run_deploy() {
   MOCK_CANDIDATE="$candidate" \
   MOCK_STALE="$stale" \
   MOCK_EXPECT_DB="${MOCK_EXPECT_DB:-}" \
+  RUNTIME_UID="${RUNTIME_UID-$test_runtime_uid}" \
+  RUNTIME_GID="${RUNTIME_GID-$test_runtime_gid}" \
   ROOT_DIR="$test_root" \
   STATE_DIR="$test_root/state" \
   GIT_BIN="$test_root/mock-git" \
@@ -165,7 +169,7 @@ assert_no_env_temp() {
 assert_status_dir() {
   [ -d "$test_root/data/status" ] || { echo "status directory missing" >&2; exit 1; }
   [ "$(stat -c '%a' "$test_root/data/status")" = 700 ] || { echo "status directory mode is not 700" >&2; exit 1; }
-  [ "$(stat -c '%u:%g' "$test_root/data/status")" = 1000:1000 ] || { echo "status directory owner is not runtime uid" >&2; exit 1; }
+  [ "$(stat -c '%u:%g' "$test_root/data/status")" = "$test_runtime_uid:$test_runtime_gid" ] || { echo "status directory owner is not runtime uid/gid" >&2; exit 1; }
 }
 
 line_of() {
@@ -200,6 +204,30 @@ write_env 'invalid:latest'
 reset_case
 if run_deploy >/dev/null 2>&1; then
   echo "invalid image unexpectedly accepted" >&2
+  exit 1
+fi
+assert_rejected_before_build
+
+write_env
+reset_case
+if RUNTIME_UID=not-a-number run_deploy >/dev/null 2>&1; then
+  echo "invalid runtime uid override unexpectedly accepted" >&2
+  exit 1
+fi
+assert_rejected_before_build
+
+write_env
+reset_case
+if RUNTIME_GID=not-a-number run_deploy >/dev/null 2>&1; then
+  echo "invalid runtime gid override unexpectedly accepted" >&2
+  exit 1
+fi
+assert_rejected_before_build
+
+write_env
+reset_case
+if RUNTIME_UID= RUNTIME_GID="$test_runtime_gid" run_deploy >/dev/null 2>&1; then
+  echo "empty runtime uid override unexpectedly accepted" >&2
   exit 1
 fi
 assert_rejected_before_build
