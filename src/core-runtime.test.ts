@@ -62,6 +62,7 @@ test("voice creation coalesces rapid re-entry and compensates a DB failure", asy
   const settings = { enabled: true, triggerChannelId: "trigger", nameTemplate: "{user} 的頻道", userLimit: 0, ownerManage: false };
   const store = {
     voiceSettings: () => settings,
+    isVoiceAccessBlocked: () => false,
     addTempVoiceChannel: () => undefined,
     removeTempVoiceChannel: () => { removes += 1; },
     tempVoiceChannel: () => undefined,

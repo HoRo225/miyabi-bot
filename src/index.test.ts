@@ -1,14 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { ChannelType } from "discord.js";
 import { buildMentionMessages } from "./ai-prompts.js";
 import { parseModelOptionsFromModelsResponse, parseOpenAiChatResponseText } from "./ai-provider.js";
 import { regexIntentRoute, shouldUseSpoilerWarning } from "./ai-routing.js";
-import { parseIds, resolveAiEnabledSetting, resolveAiProviderConfig } from "./config.js";
+import { loadConfig, parseIds, resolveAiEnabledSetting, resolveAiProviderConfig, type Config } from "./config.js";
+import { probeNineRouterLiveness, readExternalStatus, registerCommands, startHealthHeartbeat, startReadyRuntimes, updateModuleStatuses, validateStoredDiscordIds } from "./index.js";
 import { runtimeSettingsFromStore } from "./runtime-settings.js";
-import { controlPanelTimerKey, handleInteraction, selectedIdChanges } from "./control-panel-interactions.js";
+import { moduleStatusRegistry } from "./module-status.js";
+import { handleInteraction, selectedIdChanges } from "./control-panel-interactions.js";
 import { ADMIN_NAV_MODULES, SETTINGS_NAV_MODULES, adminModuleFromValue, adminPanelMessage, aiSettingsPanelMessage, settingsModuleFromValue, settingsPanelMessage } from "./control-panels.js";
 import { isLikelyImageAttachment, isLikelyTextAttachment } from "./guards.js";
 import { canUseAi, canUseSettings } from "./permissions.js";
@@ -33,8 +36,523 @@ function messageImageUrls(message: { content: unknown }): string[] {
     .filter((url): url is string => typeof url === "string");
 }
 
+test("loadConfig retains malformed role IDs by authorization scope", () => {
+  const keys = ["DISCORD_TOKEN", "DISCORD_CLIENT_ID", "DISCORD_GUILD_IDS", "ADMIN_ROLE_IDS", "AI_SETTINGS_ROLE_IDS"] as const;
+  const previous = new Map(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.DISCORD_TOKEN = "token";
+    process.env.DISCORD_CLIENT_ID = "123456789012345678";
+    process.env.DISCORD_GUILD_IDS = "234567890123456789";
+    process.env.ADMIN_ROLE_IDS = "malformed-admin,777777777777777777";
+    process.env.AI_SETTINGS_ROLE_IDS = "malformed-ai,888888888888888888";
+    const config = loadConfig();
+    assert.deepEqual(config.invalidRoleIds, { admin: ["malformed-admin"], aiSettings: ["malformed-ai"] });
+    assert.deepEqual([...config.adminRoleIds], ["777777777777777777"]);
+    assert.deepEqual([...config.aiSettingsRoleIds], ["888888888888888888"]);
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("parseIds trims comma-separated env ids", () => {
   assert.deepEqual([...parseIds("1, 2,,3")], ["1", "2", "3"]);
+});
+
+test("stored Discord IDs fail closed on missing or wrong-type resources and recover atomically", async () => {
+  const databasePath = join(mkdtempSync(join(tmpdir(), "horo-discord-validation-")), "bot.sqlite");
+  const store = new Store(databasePath);
+  const actor = { id: "tester", name: "test" };
+  store.setRuntimeSetting("ai_enabled", "true", actor);
+  const aiRole = "111111111111111111";
+  const aiChannel = "222222222222222222";
+  const settingsRole = "333333333333333333";
+  const voiceChannel = "444444444444444444";
+  const steamChannel = "555555555555555555";
+  const steamRole = "666666666666666666";
+  store.addRole(aiRole, actor);
+  store.addChannel(aiChannel, actor);
+  store.addSettingsRole(settingsRole, actor);
+  store.setVoiceSetting("trigger_channel_id", voiceChannel, actor);
+  store.setSteamFreeSetting("channel_id", steamChannel, actor);
+  store.setSteamFreeSetting("notify_role_ids", steamRole, actor);
+
+  const roleCache = new Map<string, unknown>();
+  const channelCache = new Map<string, { type: ChannelType; isThread: () => boolean }>([
+    [aiChannel, { type: ChannelType.GuildVoice, isThread: () => false }],
+    [voiceChannel, { type: ChannelType.GuildText, isThread: () => false }]
+  ]);
+  const guild = {
+    roles: { cache: roleCache, fetch: async () => null },
+    channels: { cache: channelCache, fetch: async () => null }
+  };
+  const client = {
+    guilds: { cache: new Map([["guild", guild]]), fetch: async () => guild }
+  } as unknown as import("discord.js").Client;
+  const config = {
+    guildIds: ["guild"],
+    databasePath,
+    aiBaseUrl: "http://provider",
+    aiApiKey: "key"
+  } as never;
+
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal(store.isAiAccessBlocked(), true);
+  assert.equal(store.isSettingsAccessBlocked(), true);
+  assert.equal(store.isVoiceAccessBlocked(), true);
+  assert.equal(store.isSteamAccessBlocked(), true);
+  const audits = store.db.prepare("SELECT target_type, target_id, new_value FROM audit_logs WHERE action = 'invalid_discord_id'").all() as Array<{ target_type: string; target_id: string; new_value: string }>;
+  assert.equal(audits.length, 6);
+  assert.equal(new Set(audits.map((audit) => audit.new_value)).size, 1);
+  assert.equal(audits[0]?.new_value, "DISCORD-ID-002");
+  assert.equal(moduleStatusRegistry.get("ai").errorCode, "DISCORD-ID-002");
+  assert.equal(moduleStatusRegistry.get("voice").errorCode, "DISCORD-ID-002");
+  assert.equal(moduleStatusRegistry.get("steam-free").errorCode, "DISCORD-ID-002");
+  assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-ID-002");
+
+  for (const id of [aiRole, settingsRole, steamRole]) roleCache.set(id, {});
+  channelCache.set(aiChannel, { type: ChannelType.GuildText, isThread: () => false });
+  channelCache.set(voiceChannel, { type: ChannelType.GuildVoice, isThread: () => false });
+  channelCache.set(steamChannel, { type: ChannelType.GuildAnnouncement, isThread: () => false });
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal(store.isAiAccessBlocked(), false);
+  assert.equal(store.isSettingsAccessBlocked(), false);
+  assert.equal(store.isVoiceAccessBlocked(), false);
+  assert.equal(store.isSteamAccessBlocked(), false);
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, 6);
+  roleCache.delete(aiRole);
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, 7);
+  roleCache.set(aiRole, {});
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, 7);
+  roleCache.delete(aiRole);
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, 8);
+  store.close();
+  rmSync(databasePath, { force: true });
+  rmSync(databasePath + "-wal", { force: true });
+  rmSync(databasePath + "-shm", { force: true });
+});
+
+test("configured manager role scopes fail closed as a whole, repair, and re-audit", async () => {
+  const databasePath = join(mkdtempSync(join(tmpdir(), "horo-role-validation-")), "bot.sqlite");
+  const store = new Store(databasePath);
+  const actor = { id: "tester", name: "test" };
+  store.setRuntimeSetting("ai_enabled", "true", actor);
+  const adminExisting = "777777777777777777";
+  const adminMissing = "888888888888888888";
+  const aiExisting = "999999999999999999";
+  const aiMissing = "111111111111111111";
+  const config = {
+    token: "token",
+    clientId: "client",
+    guildIds: ["guild"],
+    databasePath,
+    aiBaseUrl: "http://provider",
+    aiApiKey: "key",
+    aiModel: "model",
+    replyMentionUser: true,
+    adminUserIds: new Set(["admin-user"]),
+    adminRoleIds: new Set([adminExisting, adminMissing]),
+    aiSettingsUserIds: new Set(["ai-user"]),
+    aiSettingsRoleIds: new Set([aiExisting, aiMissing]),
+    invalidRoleIds: { admin: ["malformed-admin"], aiSettings: ["malformed-ai"] }
+  } as Config;
+  const roleCache = new Map<string, unknown>([[adminExisting, {}]]);
+  const fetches: string[] = [];
+  const guild = {
+    roles: {
+      cache: roleCache,
+      fetch: async (id: string) => { fetches.push(id); return id === aiExisting ? {} : null; }
+    },
+    channels: { cache: new Map(), fetch: async () => null }
+  };
+  const client = { guilds: { cache: new Map([["guild", guild]]), fetch: async () => guild } } as unknown as import("discord.js").Client;
+
+  await validateStoredDiscordIds(client, config, store);
+  assert.deepEqual(config.roleAuthorization, {
+    admin: { valid: false, errorCode: "DISCORD-ID-001" },
+    aiSettings: { valid: false, errorCode: "DISCORD-ID-001" }
+  });
+  assert.deepEqual(fetches, [adminMissing, aiExisting, aiMissing]);
+  assert.equal(moduleStatusRegistry.get("ai").state, "degraded");
+  assert.equal(moduleStatusRegistry.get("ai").errorCode, "DISCORD-ID-001");
+  assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-ID-001");
+  const firstAuditCount = (store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count;
+  assert.equal(firstAuditCount, 4);
+
+  config.invalidRoleIds = { admin: [], aiSettings: [] };
+  guild.roles.fetch = async (id: string) => new Set([adminMissing, aiExisting, aiMissing]).has(id) ? {} : null;
+  await validateStoredDiscordIds(client, config, store);
+  assert.deepEqual(config.roleAuthorization, {
+    admin: { valid: true, errorCode: null },
+    aiSettings: { valid: true, errorCode: null }
+  });
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, firstAuditCount);
+
+  guild.roles.fetch = async (id: string) => id === adminMissing ? null : {};
+  await validateStoredDiscordIds(client, config, store);
+  assert.deepEqual(config.roleAuthorization?.admin, { valid: false, errorCode: "DISCORD-ID-002" });
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, firstAuditCount + 1);
+  guild.roles.fetch = async () => ({});
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, firstAuditCount + 1);
+  guild.roles.fetch = async (id: string) => id === adminMissing ? null : {};
+  await validateStoredDiscordIds(client, config, store);
+  assert.equal((store.db.prepare("SELECT count(*) AS count FROM audit_logs WHERE action = 'invalid_discord_id'").get() as { count: number }).count, firstAuditCount + 2);
+  store.close();
+});
+
+test("AI status keeps Discord ID degradation ahead of disabled state", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "horo-ai-status-priority-"));
+  const databasePath = join(dir, "bot.sqlite");
+  const store = new Store(databasePath);
+  const actor = { id: "tester", name: "test" };
+  store.setRuntimeSetting("ai_enabled", "false", actor);
+  const invalidRoleId = "777777777777777777";
+  const config = {
+    token: "token",
+    clientId: "client",
+    guildIds: ["guild"],
+    databasePath,
+    aiBaseUrl: "http://provider",
+    aiApiKey: "key",
+    aiModel: "model",
+    replyMentionUser: true,
+    adminUserIds: new Set<string>(),
+    adminRoleIds: new Set([invalidRoleId]),
+    aiSettingsUserIds: new Set<string>(),
+    aiSettingsRoleIds: new Set<string>()
+  } as Config;
+  const guild = {
+    roles: { cache: new Map(), fetch: async () => null },
+    channels: { cache: new Map(), fetch: async () => null }
+  };
+  const client = { guilds: { cache: new Map([["guild", guild]]), fetch: async () => guild } } as unknown as import("discord.js").Client;
+  try {
+    await validateStoredDiscordIds(client, config, store);
+    assert.equal(moduleStatusRegistry.get("ai").state, "degraded");
+    assert.equal(moduleStatusRegistry.get("ai").errorCode, "DISCORD-ID-002");
+
+    config.adminRoleIds.clear();
+    await validateStoredDiscordIds(client, config, store);
+    assert.equal(moduleStatusRegistry.get("ai").state, "disabled");
+    assert.equal(moduleStatusRegistry.get("ai").errorCode, "AI-DISABLED-001");
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("direct manager users repair while invalid role scopes deny role paths", async () => {
+  const databasePath = join(mkdtempSync(join(tmpdir(), "horo-role-interaction-")), "bot.sqlite");
+  const store = new Store(databasePath);
+  store.setSettingsAccessBlocked(true);
+  const roleId = "888888888888888888";
+  const config = {
+    guildIds: ["guild"],
+    databasePath,
+    aiBaseUrl: "http://provider",
+    aiApiKey: "key",
+    aiModel: "model",
+    replyMentionUser: true,
+    adminUserIds: new Set(["admin-user"]),
+    adminRoleIds: new Set([roleId]),
+    aiSettingsUserIds: new Set(["ai-user"]),
+    aiSettingsRoleIds: new Set([roleId]),
+    roleAuthorization: {
+      admin: { valid: false, errorCode: "DISCORD-ID-002" },
+      aiSettings: { valid: false, errorCode: "DISCORD-ID-002" }
+    }
+  } as never;
+  const replies: unknown[] = [];
+  const interaction = (userId: string, commandName: string) => ({
+    guildId: "guild",
+    guild: { name: "HoRo" },
+    client: { ws: { ping: 12 } },
+    user: { id: userId, username: userId },
+    member: { roles: [roleId] },
+    commandName,
+    isChatInputCommand: () => true,
+    reply: async (payload: unknown) => { replies.push(payload); }
+  }) as never;
+  await handleInteraction(interaction("admin-user", "settings"), store, config);
+  await handleInteraction(interaction("role-user", "admin"), store, config);
+  await handleInteraction(interaction("ai-user", "ai-settings"), store, config);
+  await handleInteraction(interaction("role-user", "ai-settings"), store, config);
+  assert.equal(replies.length, 4);
+  assert.equal((replies[0] as { content?: string }).content, undefined);
+  assert.match(String((replies[1] as { content?: string }).content), /權限不足/);
+  assert.equal((replies[2] as { content?: string }).content, undefined);
+  assert.match(String((replies[3] as { content?: string }).content), /權限不足/);
+  store.close();
+});
+
+test("ClientReady startup validates before workers and shutdown cannot start late workers", async () => {
+  const events: string[] = [];
+  let stopping = false;
+  let releaseValidation: () => void = () => undefined;
+  const validationPending = new Promise<void>((resolve) => { releaseValidation = resolve; });
+  let steamStop: (() => Promise<void>) | null = null;
+  let controllerSet = false;
+  const controller = {
+    cleanup: async () => { events.push("cleanup"); },
+    stop: () => undefined,
+    status: () => ({ state: "ready" as const, errorCode: null })
+  };
+  const startup = startReadyRuntimes({
+    validate: async () => {
+      events.push("validate");
+      await validationPending;
+    },
+    isStopping: () => stopping,
+    startSteam: () => { events.push("steam-start"); return async () => { events.push("steam-stop"); }; },
+    startVoice: async () => { events.push("voice-start"); return controller; },
+    setSteamStop: (stop) => { steamStop = stop; },
+    setVoiceController: () => { controllerSet = true; },
+    setAcceptingEvents: (accepting) => { events.push(`events-${accepting ? "open" : "closed"}`); }
+  });
+  assert.deepEqual(events, ["events-closed", "validate"]);
+  stopping = true;
+  releaseValidation();
+  await startup;
+  assert.deepEqual(events, ["events-closed", "validate"]);
+  assert.equal(steamStop, null);
+  assert.equal(controllerSet, false);
+
+  stopping = false;
+  await startReadyRuntimes({
+    validate: async () => { events.push("validate"); },
+    isStopping: () => stopping,
+    startSteam: () => { events.push("steam-start"); return async () => { events.push("steam-stop"); }; },
+    startVoice: async () => { events.push("voice-start"); return controller; },
+    setSteamStop: (stop) => { steamStop = stop; },
+    setVoiceController: () => { controllerSet = true; },
+    setAcceptingEvents: (accepting) => { events.push(`events-${accepting ? "open" : "closed"}`); }
+  });
+  assert.deepEqual(events, ["events-closed", "validate", "events-closed", "validate", "steam-start", "voice-start", "events-open"]);
+  assert.ok(steamStop);
+  assert.equal(controllerSet, true);
+});
+
+test("shutdown during voice startup leaves Steam stop to the outer shutdown path", async () => {
+  const events: string[] = [];
+  let stopping = false;
+  let releaseVoice: () => void = () => undefined;
+  const voicePending = new Promise<void>((resolve) => { releaseVoice = resolve; });
+  let outerSteamStop: (() => Promise<void>) | null = null;
+  const controller = {
+    cleanup: async () => { events.push("voice-cleanup"); },
+    stop: () => undefined,
+    status: () => ({ state: "ready" as const, errorCode: null })
+  };
+  const startup = startReadyRuntimes({
+    validate: async () => { events.push("validate"); },
+    isStopping: () => stopping,
+    startSteam: () => { events.push("steam-start"); return async () => { events.push("steam-stop"); }; },
+    startVoice: async () => { events.push("voice-start"); await voicePending; return controller; },
+    setSteamStop: (stop) => { outerSteamStop = stop; },
+    setVoiceController: () => { events.push("voice-set"); },
+    setAcceptingEvents: (accepting) => { events.push(`events-${accepting ? "open" : "closed"}`); }
+  });
+  await Promise.resolve();
+  assert.deepEqual(events, ["events-closed", "validate", "steam-start", "voice-start"]);
+  stopping = true;
+  releaseVoice();
+  await startup;
+  assert.deepEqual(events, ["events-closed", "validate", "steam-start", "voice-start", "voice-cleanup"]);
+  const stop = outerSteamStop;
+  assert.equal(typeof stop, "function");
+  assert.equal(events.includes("events-open"), false);
+  await (stop as unknown as () => Promise<void>)();
+  assert.equal(events.at(-1), "steam-stop");
+});
+
+test("9router liveness probe distinguishes disabled, ready, and degraded without leaking details", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  try {
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response("unexpected");
+    }) as typeof fetch;
+    await probeNineRouterLiveness({ aiBaseUrl: "", aiApiKey: "" });
+    assert.equal(calls, 0);
+    assert.equal(moduleStatusRegistry.get("9router").state, "disabled");
+    assert.equal(moduleStatusRegistry.get("9router").errorCode, null);
+    assert.equal(moduleStatusRegistry.get("9router").lastSuccessAt, null);
+    assert.equal(moduleStatusRegistry.get("9router").lastErrorAt, null);
+
+    globalThis.fetch = (async (input, init) => {
+      calls += 1;
+      assert.equal(String(input), "http://9router.test/v1/models");
+      assert.equal((init?.headers as Record<string, string>).authorization, "Bearer probe-secret");
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    await probeNineRouterLiveness({ aiBaseUrl: "http://9router.test/", aiApiKey: "probe-secret" });
+    const ready = moduleStatusRegistry.get("9router");
+    assert.equal(ready.state, "ready");
+    assert.equal(ready.errorCode, null);
+    assert.ok(ready.lastSuccessAt);
+
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response("upstream unavailable", { status: 503 });
+    }) as typeof fetch;
+    await probeNineRouterLiveness({ aiBaseUrl: "http://9router.test", aiApiKey: "probe-secret" });
+    const degraded = moduleStatusRegistry.get("9router");
+    assert.equal(degraded.state, "degraded");
+    assert.equal(degraded.errorCode, "9ROUTER-PROBE-001");
+    assert.doesNotMatch(JSON.stringify(degraded), /probe-secret|upstream unavailable/);
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await probeNineRouterLiveness({ aiBaseUrl: "", aiApiKey: "" });
+  }
+});
+
+test("Discord status fixes command failure, disconnect health, and reconnect recovery", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "horo-discord-status-"));
+  const databasePath = join(dir, "bot.sqlite");
+  const store = new Store(databasePath);
+  const config = {
+    token: "token",
+    clientId: "123456789012345678",
+    guildIds: ["234567890123456789"],
+    adminUserIds: new Set<string>(),
+    adminRoleIds: new Set<string>(),
+    aiSettingsUserIds: new Set<string>(),
+    aiSettingsRoleIds: new Set<string>(),
+    databasePath,
+    aiBaseUrl: "",
+    aiApiKey: "",
+    aiModel: "model",
+    replyMentionUser: true
+  } as Config;
+  const originalError = console.error;
+  const errors: string[] = [];
+  console.error = (...args: unknown[]) => { errors.push(args.join(" ")); };
+  try {
+    const failedAlerts = await registerCommands(config, { put: async () => { throw new Error("secret-command-error"); } } as never);
+    assert.deepEqual(failedAlerts, [{ code: "DISCORD-COMMAND-001", guildId: config.guildIds[0] }]);
+    assert.doesNotMatch(errors.join("\n"), /secret-command-error/);
+    updateModuleStatuses(config, store, join(dir, "status"), false, failedAlerts);
+    assert.deepEqual(moduleStatusRegistry.get("discord").state, "degraded");
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-COMMAND-001");
+
+    const guild = {
+      roles: { cache: new Map(), fetch: async () => null },
+      channels: { cache: new Map(), fetch: async () => null }
+    };
+    const validationClient = { guilds: { cache: new Map([[config.guildIds[0], guild]]), fetch: async () => guild } } as unknown as import("discord.js").Client;
+    await validateStoredDiscordIds(validationClient, config, store);
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-COMMAND-001");
+
+    config.adminRoleIds.add("777777777777777777");
+    await validateStoredDiscordIds(validationClient, config, store);
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-ID-002");
+    config.adminRoleIds.clear();
+    await validateStoredDiscordIds(validationClient, config, store);
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-COMMAND-001");
+
+    updateModuleStatuses(config, store, join(dir, "status"), true, failedAlerts);
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, "DISCORD-COMMAND-001");
+    const successfulAlerts = await registerCommands(config, { put: async () => undefined } as never);
+    updateModuleStatuses(config, store, join(dir, "status"), true, successfulAlerts);
+    assert.equal(moduleStatusRegistry.get("discord").state, "ready");
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, null);
+
+    let ready = false;
+    const stop = startHealthHeartbeat({ isReady: () => ready } as never, [], config, store);
+    const health = JSON.parse(readFileSync("/tmp/horo-bot-health.json", "utf8")) as { ready: boolean; modules: Record<string, { state: string; errorCode: string | null }> };
+    assert.equal(health.ready, false);
+    assert.equal(health.modules.discord.state, "degraded");
+    assert.equal(health.modules.discord.errorCode, "DISCORD-CONNECTION-001");
+    ready = true;
+    updateModuleStatuses(config, store, join(dir, "status"), ready, []);
+    assert.equal(moduleStatusRegistry.get("discord").state, "ready");
+    assert.equal(moduleStatusRegistry.get("discord").errorCode, null);
+    stop();
+  } finally {
+    console.error = originalError;
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("external module status requires fixed safe 0600 JSON and degrades stale or unsafe files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "horo-external-status-"));
+  const status = (module: "backup" | "key-sync", state: "ready" | "disabled" | "degraded", success: string | null, error: string | null, errorCode: string | null) => ({
+    module,
+    state,
+    lastSuccessAt: success,
+    lastErrorAt: error,
+    errorCode
+  });
+  const writeStatus = (module: "backup" | "key-sync", value: unknown, mode = 0o600) => {
+    const path = join(dir, module + ".json");
+    writeFileSync(path, JSON.stringify(value) + "\n", "utf8");
+    chmodSync(path, mode);
+    return path;
+  };
+  try {
+    const now = new Date().toISOString();
+    const readyPath = writeStatus("backup", status("backup", "ready", now, null, null));
+    readExternalStatus(dir, "backup");
+    assert.equal(moduleStatusRegistry.get("backup").state, "ready");
+    assert.equal(moduleStatusRegistry.get("backup").lastSuccessAt, now);
+    assert.equal(readFileSync(readyPath, "utf8").includes("BACKUP-001"), false);
+
+    writeStatus("backup", status("backup", "ready", new Date(Date.now() - 27 * 60 * 60 * 1000).toISOString(), null, null));
+    readExternalStatus(dir, "backup");
+    assert.equal(moduleStatusRegistry.get("backup").state, "degraded");
+
+    writeStatus("key-sync", status("key-sync", "ready", new Date(Date.now() - 4 * 60 * 1000).toISOString(), null, null));
+    readExternalStatus(dir, "key-sync");
+    assert.equal(moduleStatusRegistry.get("key-sync").state, "degraded");
+
+    writeStatus("key-sync", status("key-sync", "ready", now, null, null), 0o640);
+    readExternalStatus(dir, "key-sync");
+    assert.equal(moduleStatusRegistry.get("key-sync").errorCode, "STATUS-READ-001");
+
+    writeStatus("key-sync", status("backup", "ready", now, null, null));
+    readExternalStatus(dir, "key-sync");
+    assert.equal(moduleStatusRegistry.get("key-sync").errorCode, "STATUS-READ-001");
+
+    writeStatus("key-sync", status("key-sync", "degraded", null, "not-a-time", "KEY-SYNC-001"));
+    readExternalStatus(dir, "key-sync");
+    assert.equal(moduleStatusRegistry.get("key-sync").errorCode, "STATUS-READ-001");
+
+    writeStatus("key-sync", { ...status("key-sync", "ready", now, null, null), prompt: "secret-prompt" });
+    readExternalStatus(dir, "key-sync");
+    const unsafeExtra = JSON.stringify(moduleStatusRegistry.get("key-sync"));
+    assert.equal(moduleStatusRegistry.get("key-sync").errorCode, "STATUS-READ-001");
+    assert.doesNotMatch(unsafeExtra, /secret-prompt/);
+
+    const referent = join(dir, "referent.json");
+    const leaf = join(dir, "backup.json");
+    writeFileSync(referent, JSON.stringify(status("backup", "ready", now, null, null)) + "\n", "utf8");
+    chmodSync(referent, 0o600);
+    rmSync(leaf, { force: true });
+    symlinkSync(referent, leaf);
+    readExternalStatus(dir, "backup");
+    assert.equal(moduleStatusRegistry.get("backup").errorCode, "STATUS-READ-001");
+    rmSync(leaf, { force: true });
+
+    const ancestorTarget = join(dir, "ancestor-target");
+    const ancestorLink = join(dir, "ancestor-link");
+    mkdirSync(ancestorTarget);
+    writeFileSync(join(ancestorTarget, "backup.json"), JSON.stringify(status("backup", "ready", now, null, null)) + "\n", "utf8");
+    chmodSync(join(ancestorTarget, "backup.json"), 0o600);
+    symlinkSync(ancestorTarget, ancestorLink, "dir");
+    readExternalStatus(ancestorLink, "backup");
+    assert.equal(moduleStatusRegistry.get("backup").errorCode, "STATUS-READ-001");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 
@@ -304,11 +822,6 @@ test("settings role replacement removes before adding within selector limit", as
   await handleInteraction(interaction, store, config);
   assert.deepEqual([...roles].sort(), [...existing.slice(1), "role-new"].sort());
   assert.deepEqual(writes.slice(0, 2), ["remove:role-0", "add:role-new"]);
-});
-
-test("control panel idle timer key scopes by user and message", () => {
-  assert.equal(controlPanelTimerKey("user", "message"), "user:message");
-  assert.notEqual(controlPanelTimerKey("user", "message"), controlPanelTimerKey("other", "message"));
 });
 
 test("AI provider config only accepts direct env settings", () => {

@@ -87,6 +87,7 @@ test("AI queue timeout expires cleanly and typing stops", async (t) => {
     setting: (key: string) => settingValues[key],
     listAllowedChannels: () => ["channel"],
     listAllowedRoles: () => [],
+    isAiAccessBlocked: () => false,
     logAiRequest: () => 1,
     recordAiResponseMessages: () => undefined,
     aiResponseChain: () => undefined

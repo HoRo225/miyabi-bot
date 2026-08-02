@@ -178,6 +178,7 @@ function makeHarness(): Harness {
     setting: (key: string) => settingValues[key],
     listAllowedChannels: () => ["channel"],
     listAllowedRoles: () => [],
+    isAiAccessBlocked: () => false,
     logAiRequest: (input: unknown) => {
       const entry = input as Omit<LogEntry, "id">;
       const id = ++requestLogId;

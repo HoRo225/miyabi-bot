@@ -9,20 +9,22 @@ import {
 } from "discord.js";
 import { safeMentions } from "./text.js";
 
-export type StatusKind = "ready" | "warn" | "off" | "error";
+export type StatusKind = "ready" | "warn" | "off" | "error" | "degraded";
 
 const STATUS_LABELS: Record<StatusKind, string> = {
   ready: "🟢 正常",
   warn: "🟡 需設定",
   off: "⚫ 未啟用",
-  error: "🔴 斷線"
+  error: "🔴 斷線",
+  degraded: "🟠 降級"
 };
 
 const STATUS_COLORS: Record<StatusKind, number> = {
   ready: 0x3fb950,
   warn: 0xd29922,
   off: 0x4e5058,
-  error: 0xf85149
+  error: 0xf85149,
+  degraded: 0xdb6d28
 };
 
 export function statusBadge(kind: StatusKind): string {
@@ -35,7 +37,7 @@ export function statusColor(kind: StatusKind): number {
 
 export function worstStatus(kinds: StatusKind[]): StatusKind {
   return kinds.reduce<StatusKind>((worst, kind) => {
-    const severity = { ready: 0, off: 1, warn: 2, error: 3 };
+    const severity = { ready: 0, off: 1, warn: 2, degraded: 3, error: 4 };
     return severity[kind] > severity[worst] ? kind : worst;
   }, "ready");
 }
@@ -107,15 +109,16 @@ export function roleSelect(customId: string, placeholder: string, defaultIds: st
   };
 }
 
-export function notificationChannelSelect(customId: string, placeholder: string, defaultId: string | null = null): ComponentJson {
+export function notificationChannelSelect(customId: string, placeholder: string, defaultId: string | string[] | null = null, multiple = false): ComponentJson {
+  const defaultIds = Array.isArray(defaultId) ? defaultId : defaultId ? [defaultId] : [];
   return {
     type: ComponentType.ChannelSelect,
     custom_id: customId,
     ...(placeholder ? { placeholder } : {}),
     min_values: 0,
-    max_values: 1,
-    channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.PublicThread, ChannelType.PrivateThread],
-    ...(defaultId ? { default_values: [{ id: defaultId, type: "channel" }] } : {})
+    max_values: multiple ? 25 : 1,
+    channel_types: [ChannelType.GuildText, ChannelType.GuildAnnouncement],
+    ...(defaultIds.length ? { default_values: defaultIds.slice(0, 25).map((id) => ({ id, type: "channel" })) } : {})
   };
 }
 

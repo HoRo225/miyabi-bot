@@ -184,12 +184,12 @@ test("tool turns send fixed tool schemas and disable parallel tool calls", async
   }
 });
 
-test("model parser caps provider options at 200", () => {
+test("model parser keeps the complete provider catalog", () => {
   const options = parseModelOptionsFromModelsResponse({
     data: Array.from({ length: 250 }, (_, index) => ({ id: `model-${index}` }))
   });
-  assert.equal(options.length, 200);
-  assert.equal(options.at(-1)?.value, "model-199");
+  assert.equal(options.length, 250);
+  assert.equal(options.at(-1)?.value, "model-249");
 });
 
 test("provider root endpoint uses the OpenAI v1 models path", async () => {
@@ -307,6 +307,7 @@ test("AI settings panel only exposes 9router controls", () => {
     listSettingsAllowedRoles: () => [],
     voiceSettings: () => ({}) as never,
     steamFreeSettings: () => ({}) as never,
+    isSettingsAccessBlocked: () => false,
     adminStats: () => ({ aiRequestLogs: 0, aiResponseMessages: 0, auditLogs: 0, allowedChannels: 0, allowedRoles: 0, settingsRoles: 0 })
   };
   const panel = JSON.stringify(aiSettingsPanelMessage({} as Interaction, store, {

@@ -15,7 +15,9 @@ import {
   steamFreeSettings,
   type SteamFreeSeenItem
 } from "./steam-free-store.js";
+import { AI_RUNTIME_SETTING_KEYS, validateAiRuntimeSettings } from "./runtime-settings.js";
 export type { SteamFreeSeenItem } from "./steam-free-store.js";
+import { isValidDiscordId } from "./config.js";
 import { resolveVoiceSettings, type VoiceSettings } from "./voice.js";
 const schema = `
 PRAGMA foreign_keys = ON;
@@ -127,19 +129,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 `;
 
 const SCHEMA_VERSION = 5;
-const RUNTIME_SETTING_KEYS = new Set([
-  "ai_enabled",
-  "ai_9router_key_id",
-  "ai_model",
-  "attachment_max_mb",
-  "ai_cooldown_seconds",
-  "ai_max_in_flight",
-  "ai_queue_max",
-  "ai_queue_timeout_seconds",
-  "ai_recent_context_limit",
-  "ai_response_max_chars",
-  "reply_mention_user"
-]);
+const RUNTIME_SETTING_KEYS = new Set<string>(AI_RUNTIME_SETTING_KEYS);
 const SELECTOR_LIMIT = 25;
 const RESPONSE_MESSAGE_COLUMNS = ["request_log_id", "message_id", "segment_index", "created_at"];
 const ROLE_COLUMNS = ["role_id", "created_by", "created_at"];
@@ -384,6 +374,11 @@ function assertDatabaseHealthy(db: DatabaseSync): void {
 
 export class Store {
   readonly db: DatabaseSync;
+  private readonly auditedInvalidDiscordIds = new Set<string>();
+  private aiAccessBlockedState = true;
+  private settingsAccessBlockedState = true;
+  private voiceAccessBlockedState = true;
+  private steamAccessBlockedState = true;
 
   constructor(databasePath: string) {
     mkdirSync(dirname(databasePath), { recursive: true });
@@ -393,6 +388,39 @@ export class Store {
     ensureSteamFreeSeenItemColumns(this.db);
     migrateSchema(this.db);
     this.pruneAiRequestLogs();
+  }
+
+  /** Runtime fail-closed gate set by Discord ID validation; persisted IDs stay untouched. */
+  setAiAccessBlocked(blocked: boolean): void {
+    this.aiAccessBlockedState = blocked;
+  }
+
+  isAiAccessBlocked(): boolean {
+    return this.aiAccessBlockedState;
+  }
+
+  setSettingsAccessBlocked(blocked: boolean): void {
+    this.settingsAccessBlockedState = blocked;
+  }
+
+  isSettingsAccessBlocked(): boolean {
+    return this.settingsAccessBlockedState;
+  }
+
+  setVoiceAccessBlocked(blocked: boolean): void {
+    this.voiceAccessBlockedState = blocked;
+  }
+
+  isVoiceAccessBlocked(): boolean {
+    return this.voiceAccessBlockedState;
+  }
+
+  setSteamAccessBlocked(blocked: boolean): void {
+    this.steamAccessBlockedState = blocked;
+  }
+
+  isSteamAccessBlocked(): boolean {
+    return this.steamAccessBlockedState;
   }
 
   listAllowedRoles(): string[] {
@@ -405,6 +433,58 @@ export class Store {
 
   listSettingsAllowedRoles(): string[] {
     return this.db.prepare("SELECT role_id FROM settings_allowed_roles ORDER BY role_id").all().map((row) => String((row as { role_id: unknown }).role_id));
+  }
+
+  storedDiscordIds(): {
+    aiRoleIds: string[];
+    settingsRoleIds: string[];
+    aiChannelIds: string[];
+    voiceChannelIds: string[];
+    steamChannelIds: string[];
+    steamRoleIds: string[];
+  } {
+    const voiceTrigger = this.voiceSettings().triggerChannelId;
+    const steam = this.steamFreeSettings();
+    return {
+      aiRoleIds: this.listAllowedRoles(),
+      settingsRoleIds: this.listSettingsAllowedRoles(),
+      aiChannelIds: this.listAllowedChannels(),
+      voiceChannelIds: voiceTrigger ? [voiceTrigger] : [],
+      steamChannelIds: steam.channelId ? [steam.channelId] : [],
+      steamRoleIds: [...steam.notifyRoleIds]
+    };
+  }
+
+  auditInvalidDiscordId(kind: "role" | "channel", id: string, errorCode: string): void {
+    const target = kind + ":" + id;
+    if (this.auditedInvalidDiscordIds.has(target)) return;
+    this.auditedInvalidDiscordIds.add(target);
+    this.audit({ id: "system", name: "runtime" }, "health", "invalid_discord_id", kind, id, null, errorCode, "degraded");
+  }
+
+  clearInvalidDiscordIdAudit(kind: "role" | "channel", id: string): void {
+    this.auditedInvalidDiscordIds.delete(kind + ":" + id);
+  }
+
+  /** Keep malformed persisted IDs and let callers fail closed. */
+  invalidStoredDiscordIds(): { roles: string[]; channels: string[]; ai: boolean; settings: boolean; voice: boolean; steam: boolean } {
+    const ids = this.storedDiscordIds();
+    const roles = new Set<string>();
+    const channels = new Set<string>();
+    const invalid = { ai: false, settings: false, voice: false, steam: false };
+    const check = (kind: "role" | "channel", id: string, module: "ai" | "settings" | "voice" | "steam"): void => {
+      if (isValidDiscordId(id)) return;
+      this.auditInvalidDiscordId(kind, id, "DISCORD-ID-001");
+      invalid[module] = true;
+      (kind === "role" ? roles : channels).add(id);
+    };
+    for (const id of ids.aiRoleIds) check("role", id, "ai");
+    for (const id of ids.settingsRoleIds) check("role", id, "settings");
+    for (const id of ids.aiChannelIds) check("channel", id, "ai");
+    for (const id of ids.voiceChannelIds) check("channel", id, "voice");
+    for (const id of ids.steamChannelIds) check("channel", id, "steam");
+    for (const id of ids.steamRoleIds) check("role", id, "steam");
+    return { roles: [...roles], channels: [...channels], ...invalid };
   }
 
   adminStats(): {
@@ -522,14 +602,37 @@ export class Store {
   }
 
   setRuntimeSetting(key: string, value: string, actor: UserRef): void {
-    if (!RUNTIME_SETTING_KEYS.has(key)) throw new Error(`runtime_setting_not_allowed:${key}`);
-    const oldValue = this.setting(key);
-    this.db.prepare(`
-      INSERT INTO ai_runtime_settings (key, value, updated_by, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at
-    `).run(key, value, actor.id, now());
-    this.audit(actor, "ai-settings", "set_runtime_setting", "setting", key, redact(key, oldValue), redact(key, value), "ok");
+    this.setRuntimeSettings({ [key]: value }, actor);
+  }
+
+  /** Validate every value before beginning the transaction. */
+  setRuntimeSettings(entries: Readonly<Record<string, string>>, actor: UserRef): void {
+    if (Object.keys(entries).some((key) => !RUNTIME_SETTING_KEYS.has(key))) {
+      const invalidKey = Object.keys(entries).find((key) => !RUNTIME_SETTING_KEYS.has(key));
+      throw new Error(`runtime_setting_not_allowed:${invalidKey}`);
+    }
+    validateAiRuntimeSettings(entries);
+    const oldValues = Object.fromEntries(Object.keys(entries).map((key) => [key, this.setting(key)]));
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const upsert = this.db.prepare(`
+        INSERT INTO ai_runtime_settings (key, value, updated_by, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at
+      `);
+      for (const [key, value] of Object.entries(entries)) {
+        upsert.run(key, value, actor.id, now());
+        this.audit(actor, "ai-settings", "set_runtime_setting", "setting", key, redact(key, oldValues[key]), redact(key, value), "ok");
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Preserve the original insert error.
+      }
+      throw error;
+    }
   }
 
   setVoiceSetting(key: string, value: string, actor: UserRef): void {

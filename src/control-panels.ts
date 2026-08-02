@@ -12,6 +12,7 @@ import {
 import type { AiModelOption } from "./ai-provider.js";
 import {
   clampInteger,
+  resolveAiEnabledSetting,
   type Config
 } from "./config.js";
 import { memberRoleIds } from "./discord-message-runtime.js";
@@ -35,10 +36,12 @@ import {
   type RowComponent,
   type StatusKind
 } from "./discord-ui.js";
-import { steamFreeStatusLabel, type SteamFreeSettings } from "./steam-free.js";
+import { steamFreeIntervalMinutes, steamFreeStatusLabel, type SteamFreeSettings } from "./steam-free.js";
 import { discordTimestampText, inlineCodeText } from "./text.js";
 import { nineRouterKeyOptions, readNineRouterKeyState, type NineRouterKeyState } from "./nine-router-keys.js";
 import { voiceStatusLabel, type VoiceSettings } from "./voice.js";
+import { aiRuntimeLimitsFromStore, type AiRuntimeLimits } from "./runtime-settings.js";
+import { MODULE_STATUS_LABELS, moduleStatusRegistry, type ModuleStatusName, type ModuleStatusState } from "./module-status.js";
 
 type AdminStats = {
   aiRequestLogs: number;
@@ -52,13 +55,18 @@ type AdminStats = {
 type ControlPanelStore = {
   setting(key: string): string | undefined;
   listSettingsAllowedRoles(): string[];
+  isSettingsAccessBlocked(): boolean;
   voiceSettings(): VoiceSettings;
   steamFreeSettings(): SteamFreeSettings;
+  steamFreeSetting?: (key: string) => string | undefined;
   adminStats(): AdminStats;
+  listAllowedRoles?: () => string[];
+  listAllowedChannels?: () => string[];
 };
 const packageJson = createRequire(import.meta.url)("../package.json") as { version?: string };
 export type AdminModule = "status" | "settings";
 export type SettingsModule = "overview" | "voice" | "steam-free";
+export type AiSettingsModule = "overview" | "access" | "limits" | "provider";
 
 const ADMIN_MODULE_LABELS: Record<AdminModule, string> = {
   status: "總覽",
@@ -71,6 +79,13 @@ const SETTINGS_MODULE_LABELS: Record<SettingsModule, string> = {
   "steam-free": "Steam 免費遊戲"
 };
 
+const AI_SETTINGS_MODULE_LABELS: Record<AiSettingsModule, string> = {
+  overview: "總覽",
+  access: "存取權限",
+  limits: "執行限制",
+  provider: "Provider"
+};
+
 export const ADMIN_NAV_MODULES: Array<{ label: string; value: AdminModule; description: string }> = [
   { label: "總覽", value: "status", description: "服務狀態與資料量" },
   { label: "設定權限", value: "settings", description: "/settings 可用身分組" }
@@ -79,6 +94,13 @@ export const SETTINGS_NAV_MODULES: Array<{ label: string; value: SettingsModule;
   { label: "總覽", value: "overview", description: "權限與模組狀態" },
   { label: "動態語音", value: "voice", description: "入口頻道與命名" },
   { label: "Steam 免費遊戲", value: "steam-free", description: "通知頻道與身分組" }
+];
+
+export const AI_SETTINGS_NAV_MODULES: Array<{ label: string; value: AiSettingsModule; description: string }> = [
+  { label: "總覽", value: "overview", description: "目前模型、連線與模組狀態" },
+  { label: "存取權限", value: "access", description: "AI 允許頻道與身分組" },
+  { label: "執行限制", value: "limits", description: "併發、佇列與回應上限" },
+  { label: "Provider", value: "provider", description: "9router key 與模型清單" }
 ];
 
 function settingsModuleLabel(module: SettingsModule): string {
@@ -98,13 +120,31 @@ export function settingsModuleFromValue(value: string): SettingsModule | null {
   return SETTINGS_NAV_MODULES.some((item) => item.value === value) ? value as SettingsModule : null;
 }
 
-function settingsPanelComponents(store: ControlPanelStore, _config: Config, module: SettingsModule = "overview"): APIMessageTopLevelComponent[] {
+function aiSettingsModuleLabel(module: AiSettingsModule): string {
+  return AI_SETTINGS_MODULE_LABELS[module] ?? module;
+}
+
+function aiSettingsModuleSelect(module: AiSettingsModule): RowComponent {
+  const options = AI_SETTINGS_NAV_MODULES.map((item) => ({
+    label: item.value === module ? "✓ " + item.label : item.label,
+    value: item.value,
+    description: item.description
+  }));
+  return stringSelect("ai:module", "目前：" + aiSettingsModuleLabel(module), options) ?? actionRow([]);
+}
+
+export function aiSettingsModuleFromValue(value: string): AiSettingsModule | null {
+  return AI_SETTINGS_NAV_MODULES.some((item) => item.value === value) ? value as AiSettingsModule : null;
+}
+
+function settingsPanelComponents(store: ControlPanelStore, _config: Config, module: SettingsModule = "overview", steamNotice?: string): APIMessageTopLevelComponent[] {
   const settingsRoles = store.listSettingsAllowedRoles();
   const voice = store.voiceSettings();
   const voiceStatus: StatusKind = voiceStatusLabel(voice);
   const steamFree = store.steamFreeSettings();
   const steamStatus: StatusKind = steamFreeStatusLabel(steamFree);
   const steamFreeReady = steamStatus === "ready";
+  const steamInterval = steamFreeIntervalMinutes(store.steamFreeSetting?.("interval_minutes"));
   const children: ComponentJson[] = [
     textDisplay("## ⚙️ 設定"),
     settingsModuleSelect(module),
@@ -148,11 +188,14 @@ function settingsPanelComponents(store: ControlPanelStore, _config: Config, modu
         "### Steam 免費遊戲",
         "狀態 · " + statusBadge(steamStatus),
         "通知頻道 · " + (steamFree.channelId ? "<#" + steamFree.channelId + ">" : "未設定"),
+        "檢查間隔 · " + steamInterval + " 分鐘",
         "最近檢查 · " + discordTimestampText(steamFree.lastCheckedAt),
-        "通知身分組 · " + (steamFree.notifyRoleIds.length ? mentionList(steamFree.notifyRoleIds, (id) => "<@&" + id + ">") : "未設定")
+        "通知身分組 · " + (steamFree.notifyRoleIds.length ? mentionList(steamFree.notifyRoleIds, (id) => "<@&" + id + ">") : "未設定"),
+        ...(steamNotice ? ["最近操作 · " + steamNotice] : [])
       ].join("\n")),
       actionRow([
         button("settings:steam-free:toggle", steamFree.enabled ? "停用" : "啟用", steamFree.enabled ? ButtonStyle.Danger : ButtonStyle.Primary),
+        button("settings:steam-free:options", "編輯選項", ButtonStyle.Primary),
         button("settings:steam-free:check", "立即檢查", ButtonStyle.Primary, !steamFreeReady),
         button("settings:steam-free:test", "測試訊息", ButtonStyle.Secondary, !steamFree.channelId)
       ]),
@@ -164,12 +207,12 @@ function settingsPanelComponents(store: ControlPanelStore, _config: Config, modu
   return [componentContainer(children, worstStatus([voiceStatus, steamStatus]))];
 }
 
-export function settingsPanelMessage(_interaction: Interaction, store: ControlPanelStore, config: Config, module: SettingsModule = "overview"): PanelMessage {
-  return panelMessage(settingsPanelComponents(store, config, module));
+export function settingsPanelMessage(_interaction: Interaction, store: ControlPanelStore, config: Config, module: SettingsModule = "overview", steamNotice?: string): PanelMessage {
+  return panelMessage(settingsPanelComponents(store, config, module, steamNotice));
 }
 
-export function settingsPanelUpdate(_interaction: Interaction, store: ControlPanelStore, config: Config, module: SettingsModule = "overview"): PanelUpdate {
-  return panelUpdate(settingsPanelComponents(store, config, module));
+export function settingsPanelUpdate(_interaction: Interaction, store: ControlPanelStore, config: Config, module: SettingsModule = "overview", steamNotice?: string): PanelUpdate {
+  return panelUpdate(settingsPanelComponents(store, config, module, steamNotice));
 }
 
 function adminModuleLabel(module: AdminModule): string {
@@ -207,8 +250,25 @@ function enabledModuleLines(store: ControlPanelStore): string[] {
     "/settings · " + (settingsRoles.length ? mentionList(settingsRoles, (id) => "<@&" + id + ">") : "未設定")
   ];
 }
+
+function moduleStatusKind(state: ModuleStatusState): StatusKind {
+  return state === "ready" ? "ready" : state === "disabled" ? "off" : "degraded";
+}
+
+function moduleStatusLines(): string[] {
+  return moduleStatusRegistry.snapshot().map((status) => {
+    const label = MODULE_STATUS_LABELS[status.module as ModuleStatusName] ?? status.module;
+    const lastSuccess = discordTimestampText(status.lastSuccessAt);
+    const errorCode = status.errorCode ? " · " + inlineCodeText(status.errorCode) : "";
+    return statusBadge(moduleStatusKind(status.state)) + " · " + label +
+      " · 最近成功 " + lastSuccess + errorCode;
+  });
+}
+
 function canOpenAiSettings(interaction: Interaction, config: Config): boolean {
-  return config.aiSettingsUserIds.has(interaction.user.id) || memberRoleIds(interaction.member).some((id) => config.aiSettingsRoleIds.has(id));
+  const roles = memberRoleIds(interaction.member);
+  return Boolean(config.aiSettingsUserIds?.has(interaction.user.id)) || roles.some((id) => Boolean(config.aiSettingsRoleIds?.has(id))) ||
+    Boolean(config.adminUserIds?.has(interaction.user.id)) || roles.some((id) => Boolean(config.adminRoleIds?.has(id)));
 }
 
 function formatBytes(bytes: number): string {
@@ -242,7 +302,7 @@ function adminPanelComponents(interaction: Interaction, store: ControlPanelStore
     }
     const database = databaseStatus(config.databasePath);
     const databaseKind: StatusKind = statsStatus === "error" ? "error" : database.kind;
-    panelStatus = databaseKind;
+    panelStatus = worstStatus([databaseKind, ...moduleStatusRegistry.snapshot().map((status) => moduleStatusKind(status.state))]);
     const version = typeof packageJson.version === "string" ? packageJson.version : "未知";
     const guildName = interaction.guild?.name ?? interaction.guildId ?? "未知";
     children.push(
@@ -258,6 +318,9 @@ function adminPanelComponents(interaction: Interaction, store: ControlPanelStore
         "AI 請求 " + stats.aiRequestLogs + " · 回覆訊息 " + stats.aiResponseMessages,
         "允許頻道 " + stats.allowedChannels + " · 允許角色 " + stats.allowedRoles + " · 設定角色 " + stats.settingsRoles,
         "Audit " + stats.auditLogs,
+        "",
+        "### 模組狀態",
+        ...moduleStatusLines(),
         "",
         "### 功能",
         ...enabledModuleLines(store)
@@ -318,7 +381,7 @@ function aiKeySelectionComponents(state: NineRouterKeyState, selectedId: string)
   return children;
 }
 
-function aiSettingsPanelComponents(store: ControlPanelStore, config: Config): APIMessageTopLevelComponent[] {
+function aiProviderPanelChildren(store: ControlPanelStore, config: Config): { children: ComponentJson[]; status: StatusKind } {
   const baseUrl = config.aiBaseUrl;
   const model = (store.setting("ai_model") || config.aiModel).trim();
   const hasKey = Boolean(config.aiApiKey);
@@ -332,30 +395,112 @@ function aiSettingsPanelComponents(store: ControlPanelStore, config: Config): AP
     "目前 · " + (model ? inlineCodeText(model) : statusBadge("warn")),
     ...(!model ? ["-# 按「重新讀取模型」後從清單選一個。"] : [])
   ];
-  const children: ComponentJson[] = [
-    textDisplay("## 🤖 9router 設定"),
-    separator(),
+  return {
+    status: panelStatus,
+    children: [
+      textDisplay([
+        "### 連線",
+        "狀態 · " + statusBadge(connectionStatus),
+        connectionStatus === "ready" ? "-# Endpoint 與 API key 由 server 環境設定" : "-# server 尚未設定 Endpoint 與 API key"
+      ].join("\n")),
+      textDisplay(modelLines.join("\n")),
+      ...aiKeySelectionComponents(keyState, selectedKeyId),
+      actionRow([
+        button("ai:provider-refresh", "重新讀取模型", ButtonStyle.Primary),
+        button("ai:test", "測試連線", ButtonStyle.Secondary, !baseUrl || !hasKey)
+      ])
+    ]
+  };
+}
+
+function aiAccessPanelChildren(store: ControlPanelStore): ComponentJson[] {
+  const channels = store.listAllowedChannels?.() ?? [];
+  const roles = store.listAllowedRoles?.() ?? [];
+  return [
     textDisplay([
-      "### 連線",
-      "狀態 · " + statusBadge(connectionStatus),
-      connectionStatus === "ready" ? "-# Endpoint 與 API key 由 server 環境設定" : "-# server 尚未設定 Endpoint 與 API key"
+      "### AI 可用頻道",
+      channels.length ? mentionList(channels, (id) => "<#" + id + ">") : "未設定（所有頻道皆拒絕）",
+      "",
+      "### AI 可用身分組",
+      roles.length ? mentionList(roles, (id) => "<@&" + id + ">") : "未設定（僅 AI_SETTINGS 管理者可測試）",
+      "",
+      "-# AI manager 可略過身分組，但不能略過頻道；Thread 一律拒絕。"
     ].join("\n")),
-    textDisplay(modelLines.join("\n")),
-    ...aiKeySelectionComponents(keyState, selectedKeyId),
-    actionRow([
-      button("ai:provider-refresh", "重新讀取模型", ButtonStyle.Primary),
-      button("ai:test", "測試連線", ButtonStyle.Secondary, !baseUrl || !hasKey)
-    ])
+    actionRow([notificationChannelSelect("ai:access:channels", "選擇 AI 允許頻道", channels, true)]),
+    actionRow([roleSelect("ai:access:roles", "選擇 AI 允許身分組", roles)])
   ];
-  return [componentContainer(children, panelStatus)];
 }
 
-export function aiSettingsPanelMessage(_interaction: Interaction, store: ControlPanelStore, config: Config): PanelMessage {
-  return panelMessage(aiSettingsPanelComponents(store, config));
+function aiLimitLines(limits: AiRuntimeLimits): string[] {
+  return [
+    "冷卻 · " + limits.cooldownSeconds + " 秒",
+    "同時處理 · " + limits.maxInFlight,
+    "佇列 · " + limits.queueMax + "（逾時 " + limits.queueTimeoutSeconds + " 秒）",
+    "近期上下文 · " + limits.recentContextMessages + " 則",
+    "附件 · " + Math.round(limits.attachmentMaxBytes / (1024 * 1024)) + " MB",
+    "回應 · " + limits.responseMaxChars + " 字"
+  ];
 }
 
-export function aiSettingsPanelUpdate(_interaction: Interaction, store: ControlPanelStore, config: Config): PanelUpdate {
-  return panelUpdate(aiSettingsPanelComponents(store, config));
+function aiLimitsPanelChildren(store: ControlPanelStore): ComponentJson[] {
+  const limits = aiRuntimeLimitsFromStore(store);
+  return [
+    textDisplay(["### AI 執行限制", ...aiLimitLines(limits), "", "-# 所有欄位必須通過範圍驗證；整批驗證成功才會套用。"].join("\n")),
+    actionRow([button("ai:limits:edit", "編輯限制", ButtonStyle.Primary)])
+  ];
+}
+
+export function aiLimitsModal(store: ControlPanelStore): ModalBuilder {
+  const limits = aiRuntimeLimitsFromStore(store);
+  const fields: Array<[string, string, string]> = [
+    ["ai-cooldown-seconds", "冷卻秒數（1-60）", String(limits.cooldownSeconds)],
+    ["ai-max-in-flight", "同時處理數（1-10）", String(limits.maxInFlight)],
+    ["ai-queue-max", "佇列上限（1-10）", String(limits.queueMax)],
+    ["ai-queue-timeout-seconds", "佇列逾時秒數（30-300）", String(limits.queueTimeoutSeconds)],
+    ["ai-runtime-extra", "上下文/附件MB/回應字數（逗號分隔）", [
+      limits.recentContextMessages,
+      Math.round(limits.attachmentMaxBytes / (1024 * 1024)),
+      limits.responseMaxChars
+    ].join(",")]
+  ];
+  return new ModalBuilder().setCustomId("ai:limits-modal").setTitle("AI 執行限制").addComponents(fields.map(([id, label, value]) =>
+    new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder()
+      .setCustomId(id).setLabel(label).setStyle(TextInputStyle.Short).setRequired(true).setValue(value))));
+}
+
+function aiSettingsPanelComponents(store: ControlPanelStore, config: Config, module: AiSettingsModule = "overview"): APIMessageTopLevelComponent[] {
+  const provider = aiProviderPanelChildren(store, config);
+  const children: ComponentJson[] = [textDisplay("## 🤖 9router 設定 · AI"), aiSettingsModuleSelect(module), separator()];
+  let status = provider.status;
+  if (module === "overview") {
+    const limits = aiRuntimeLimitsFromStore(store);
+    children.push(textDisplay([
+      "### 狀態",
+      "Provider · " + statusBadge(provider.status),
+      "模型 · " + ((store.setting("ai_model") || config.aiModel).trim() || statusBadge("warn")),
+      "執行 · " + (resolveAiEnabledSetting(store.setting("ai_enabled")) ? statusBadge("ready") : statusBadge("off") + "（部署停用）"),
+      "",
+      "### 限制",
+      ...aiLimitLines(limits)
+    ].join("\n")), ...provider.children.slice(1));
+  } else if (module === "access") {
+    children.push(...aiAccessPanelChildren(store));
+    status = "ready";
+  } else if (module === "limits") {
+    children.push(...aiLimitsPanelChildren(store));
+    status = "ready";
+  } else {
+    children.push(textDisplay("### Provider"), ...provider.children);
+  }
+  return [componentContainer(children, status)];
+}
+
+export function aiSettingsPanelMessage(_interaction: Interaction, store: ControlPanelStore, config: Config, module: AiSettingsModule = "overview"): PanelMessage {
+  return panelMessage(aiSettingsPanelComponents(store, config, module));
+}
+
+export function aiSettingsPanelUpdate(_interaction: Interaction, store: ControlPanelStore, config: Config, module: AiSettingsModule = "overview"): PanelUpdate {
+  return panelUpdate(aiSettingsPanelComponents(store, config, module));
 }
 
 function aiModelLoadingPanelComponents(currentModel: string): APIMessageTopLevelComponent[] {
@@ -389,7 +534,7 @@ export function aiModelSelectPanelUpdate(
   keyState: NineRouterKeyState = { keys: [], appliedId: "", updatedAt: "", overflow: false },
   selectedKeyId = ""
 ): PanelUpdate {
-  const displayOptions = displayModelOptions(options.slice(0, 200), currentModel);
+  const displayOptions = displayModelOptions(options, currentModel);
   const totalPages = Math.max(1, Math.ceil(displayOptions.length / 25));
   const safePage = clampInteger(page, 0, totalPages - 1);
   const start = safePage * 25;
@@ -495,5 +640,20 @@ export function voiceSettingsModal(store: ControlPanelStore): ModalBuilder {
         .setStyle(TextInputStyle.Short)
         .setRequired(false)
         .setValue(voice.ownerManage ? "開啟" : "關閉"))
+    );
+}
+
+export function steamFreeSettingsModal(store: ControlPanelStore): ModalBuilder {
+  const interval = steamFreeIntervalMinutes(store.steamFreeSetting?.("interval_minutes"));
+  return new ModalBuilder()
+    .setCustomId("settings:steam-free-modal")
+    .setTitle("Steam 免費遊戲")
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(new TextInputBuilder()
+        .setCustomId("steam-free-interval")
+        .setLabel("檢查間隔（15-180 分鐘）")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setValue(String(interval)))
     );
 }

@@ -58,6 +58,13 @@ export type AiModelOption = {
   value: string;
 };
 
+export type AiModelCatalogPage = {
+  options: AiModelOption[];
+  nextUrl: string | null;
+  nextCursor: string | null;
+  hasMore: boolean | null;
+};
+
 type OpenAiStreamChunk = {
   choices?: Array<{
     delta?: { content?: unknown; tool_calls?: unknown };
@@ -84,9 +91,76 @@ export function parseModelOptionsFromModelsResponse(body: unknown): AiModelOptio
     const label = (typeof name === "string" && name.trim() ? name.trim() : value).slice(0, 100);
     seen.add(value);
     options.push({ label, value });
-    if (options.length === 200) break;
   }
   return options;
+}
+
+export function parseModelCatalogPage(body: unknown): AiModelCatalogPage {
+  const root = asRecord(body);
+  const pagination = asRecord(root?.pagination);
+  const meta = asRecord(root?.meta);
+  const links = asRecord(root?.links);
+  const nextValue = firstString(
+    root?.next,
+    root?.next_url,
+    root?.nextUrl,
+    root?.next_page,
+    root?.nextPage,
+    pagination?.next,
+    pagination?.next_url,
+    pagination?.nextUrl,
+    asRecord(pagination?.next)?.href,
+    meta?.next,
+    meta?.next_url,
+    meta?.nextUrl,
+    asRecord(meta?.next)?.href,
+    links?.next,
+    asRecord(links?.next)?.href,
+    asRecord(links?.next)?.url,
+    asRecord(root?.next)?.href,
+    asRecord(root?.next)?.url
+  );
+  const nextCursor = firstString(
+    root?.next_cursor,
+    root?.nextCursor,
+    pagination?.next_cursor,
+    pagination?.nextCursor,
+    meta?.next_cursor,
+    meta?.nextCursor
+  );
+  return {
+    options: parseModelOptionsFromModelsResponse(body),
+    nextUrl: nextValue,
+    nextCursor,
+    hasMore: firstBoolean(
+      root?.has_more,
+      root?.hasMore,
+      pagination?.has_more,
+      pagination?.hasMore,
+      meta?.has_more,
+      meta?.hasMore
+    )
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : null;
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const trimmed = value.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+function firstBoolean(...values: unknown[]): boolean | null {
+  for (const value of values) {
+    if (typeof value === "boolean") return value;
+  }
+  return null;
 }
 
 export function parseOpenAiChatResponseText(body: string, contentType = ""): OpenAiChatResponse {

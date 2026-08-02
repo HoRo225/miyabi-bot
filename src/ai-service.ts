@@ -1,5 +1,5 @@
 import {
-  parseModelOptionsFromModelsResponse,
+  parseModelCatalogPage,
   parseOpenAiChatResponseText,
   parseToolCalls,
   type AiProviderMessage,
@@ -10,6 +10,8 @@ import {
 import type { Config } from "./config.js";
 
 const MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024;
+const MAX_MODEL_CATALOG_PAGES = 100;
+const CANARY_PROMPT = "Reply with OK.";
 
 function openAiBaseUrl(value: string): string {
   const baseUrl = value.replace(/\/+$/, "");
@@ -42,22 +44,126 @@ class AiServiceError extends Error {
   }
 }
 
-export async function fetchAiModelOptions(config: Pick<Config, "aiBaseUrl" | "aiApiKey">): Promise<AiModelOption[]> {
+export async function fetchAiModelOptions(
+  config: Pick<Config, "aiBaseUrl" | "aiApiKey">,
+  maxPages = MAX_MODEL_CATALOG_PAGES
+): Promise<AiModelOption[]> {
   const normalizedBaseUrl = openAiBaseUrl(config.aiBaseUrl);
-  const response = await fetch(`${normalizedBaseUrl}/models`, {
-    headers: {
-      accept: "application/json",
-      authorization: `Bearer ${config.aiApiKey}`
-    },
-    signal: AbortSignal.timeout(10_000)
-  });
-  if (!response.ok) throw new Error(`AI models request failed: HTTP ${response.status}`);
-  try {
-    return parseModelOptionsFromModelsResponse(JSON.parse(await readProviderResponseText(response)));
-  } catch (error) {
-    if (error instanceof AiServiceError) throw error;
-    throw new Error("AI models request returned an invalid response");
+  const firstUrl = `${normalizedBaseUrl}/models`;
+  const providerOrigin = providerUrlOrigin(firstUrl);
+  const seenUrls = new Set<string>();
+  const options = new Map<string, AiModelOption>();
+  let pageUrl = firstUrl;
+  for (let page = 0; page < maxPages; page += 1) {
+    if (seenUrls.has(pageUrl)) throw new Error("AI models response returned invalid pagination");
+    seenUrls.add(pageUrl);
+    const response = await fetch(pageUrl, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${config.aiApiKey}`
+      },
+      signal: AbortSignal.timeout(10_000)
+    });
+    if (!response.ok) throw new Error(`AI models request failed: HTTP ${response.status}`);
+    let body: unknown;
+    try {
+      body = JSON.parse(await readProviderResponseText(response));
+    } catch (error) {
+      if (error instanceof AiServiceError) throw error;
+      throw new Error("AI models request returned an invalid response");
+    }
+    const catalogPage = parseModelCatalogPage(body);
+    for (const option of catalogPage.options) {
+      if (!options.has(option.value)) options.set(option.value, option);
+    }
+
+    let next = catalogPage.nextUrl;
+    if (!next && catalogPage.nextCursor) {
+      const cursorUrl = new URL(pageUrl);
+      cursorUrl.searchParams.set("cursor", catalogPage.nextCursor);
+      next = cursorUrl.toString();
+    }
+    if (!next) {
+      if (catalogPage.hasMore === true) throw catalogIncompleteFailure();
+      return [...options.values()];
+    }
+    pageUrl = resolveModelCatalogNextUrl(next, pageUrl, providerOrigin);
   }
+  throw catalogIncompleteFailure();
+}
+
+export async function canaryAiModel(
+  config: Pick<Config, "aiBaseUrl" | "aiApiKey">,
+  candidateModel: string
+): Promise<void> {
+  const model = candidateModel.trim();
+  if (!config.aiApiKey.trim() || !model || model.length > 100) throw canaryFailure();
+  let response: Response;
+  try {
+    response = await fetch(`${openAiBaseUrl(config.aiBaseUrl)}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${config.aiApiKey}`
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: CANARY_PROMPT }],
+        max_tokens: 1
+      }),
+      signal: AbortSignal.timeout(30_000)
+    });
+  } catch {
+    throw canaryFailure();
+  }
+  if (!response.ok) throw canaryFailure();
+  try {
+    const json = parseOpenAiChatResponseText(
+      await readProviderResponseText(response),
+      response.headers.get("content-type") ?? ""
+    );
+    const message = json.choices?.[0]?.message;
+    const content = typeof message?.content === "string" ? message.content : "";
+    if (!content.trim() && !parseToolCalls(message?.tool_calls).length) throw canaryFailure();
+  } catch (error) {
+    if (error instanceof AiServiceError && error.logType === "ai_model_canary_failed") throw error;
+    throw canaryFailure();
+  }
+}
+
+function providerUrlOrigin(value: string): string {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "";
+  }
+}
+
+function resolveModelCatalogNextUrl(next: string, current: string, providerOrigin: string): string {
+  let resolved: URL;
+  try {
+    resolved = new URL(next, current);
+  } catch {
+    throw new Error("AI models response returned invalid pagination");
+  }
+  if (
+    !providerOrigin
+    || resolved.origin !== providerOrigin
+    || (resolved.protocol !== "http:" && resolved.protocol !== "https:")
+    || resolved.username
+    || resolved.password
+  ) {
+    throw new Error("AI models response returned unsafe pagination");
+  }
+  return resolved.toString();
+}
+
+function canaryFailure(): AiServiceError {
+  return new AiServiceError("AI-PROVIDER-001", "ai_model_canary_failed", "AI model canary failed");
+}
+
+function catalogIncompleteFailure(): AiServiceError {
+  return new AiServiceError("AI-PROVIDER-001", "ai_model_catalog_incomplete", "AI model catalog is incomplete");
 }
 
 export async function callAiProvider(store: AiSettingsStore, config: Config, messages: AiProviderMessage[]): Promise<AiProviderResult> {

@@ -23,6 +23,22 @@ type RuntimeSettingsStore = {
   setting(key: string): string | undefined;
 };
 
+export const AI_RUNTIME_SETTING_KEYS = [
+  "ai_enabled",
+  "ai_9router_key_id",
+  "ai_model",
+  "attachment_max_mb",
+  "ai_cooldown_seconds",
+  "ai_max_in_flight",
+  "ai_queue_max",
+  "ai_queue_timeout_seconds",
+  "ai_recent_context_limit",
+  "ai_response_max_chars",
+  "reply_mention_user"
+] as const;
+
+export type AiRuntimeSettingKey = (typeof AI_RUNTIME_SETTING_KEYS)[number];
+
 const DEFAULT_AI_RUNTIME_LIMITS: AiRuntimeLimits = {
   cooldownSeconds: 10,
   maxInFlight: 2,
@@ -32,6 +48,55 @@ const DEFAULT_AI_RUNTIME_LIMITS: AiRuntimeLimits = {
   attachmentMaxBytes: 10 * 1024 * 1024,
   responseMaxChars: 12_000
 };
+
+const INTEGER_SETTING_RULES: Record<string, { minimum: number; maximum: number }> = {
+  attachment_max_mb: { minimum: 1, maximum: 25 },
+  ai_cooldown_seconds: { minimum: 1, maximum: 60 },
+  ai_max_in_flight: { minimum: 1, maximum: 10 },
+  ai_queue_max: { minimum: 1, maximum: 10 },
+  ai_queue_timeout_seconds: { minimum: 30, maximum: 300 },
+  ai_recent_context_limit: { minimum: 1, maximum: 50 },
+  ai_response_max_chars: { minimum: 2_000, maximum: 12_000 }
+};
+
+const BOOLEAN_SETTINGS = new Set(["ai_enabled", "reply_mention_user"]);
+const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
+const KEY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function parseBooleanSetting(value: string): boolean | null {
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "off"].includes(normalized)) return false;
+  return null;
+}
+
+/** Validate a complete batch before any Store write occurs. */
+export function validateAiRuntimeSettings(entries: Readonly<Record<string, string>>): void {
+  for (const [key, value] of Object.entries(entries)) {
+    if (!(AI_RUNTIME_SETTING_KEYS as readonly string[]).includes(key)) {
+      throw new Error(`runtime_setting_not_allowed:${key}`);
+    }
+    if (typeof value !== "string") throw new Error(`runtime_setting_invalid:${key}`);
+    if (BOOLEAN_SETTINGS.has(key)) {
+      if (parseBooleanSetting(value) === null) throw new Error(`runtime_setting_invalid:${key}`);
+      continue;
+    }
+    if (key === "ai_model") {
+      if (!MODEL_ID_PATTERN.test(value.trim())) throw new Error("runtime_setting_invalid:ai_model");
+      continue;
+    }
+    if (key === "ai_9router_key_id") {
+      if (value.trim() && !KEY_ID_PATTERN.test(value.trim())) throw new Error("runtime_setting_invalid:ai_9router_key_id");
+      continue;
+    }
+    const rule = INTEGER_SETTING_RULES[key];
+    if (!rule) throw new Error(`runtime_setting_not_allowed:${key}`);
+    const parsed = Number(value.trim());
+    if (!Number.isInteger(parsed) || parsed < rule.minimum || parsed > rule.maximum) {
+      throw new Error(`runtime_setting_invalid:${key}`);
+    }
+  }
+}
 
 function settingNumber(
   store: RuntimeSettingsStore,
@@ -99,4 +164,4 @@ export function runtimeSettingsFromStore(
   };
 }
 
-export { DEFAULT_AI_RUNTIME_LIMITS };
+export { DEFAULT_AI_RUNTIME_LIMITS, INTEGER_SETTING_RULES };
