@@ -7,16 +7,19 @@ import {
 import {
   aiError,
   callAiProvider,
+  canaryAiModel,
   fetchAiModelOptions
 } from "./ai-service.js";
-import type { Config } from "./config.js";
+import { roleScopeIsValid, type Config } from "./config.js";
 import {
   adminModuleFromValue,
   adminPanelMessage,
   adminPanelUpdate,
   aiModelLoadingPanelUpdate,
   aiModelSelectPanelUpdate,
+  aiLimitsModal,
   aiProviderStatusPanelUpdate,
+  aiSettingsModuleFromValue,
   aiSettingsPanelMessage,
   aiSettingsPanelUpdate,
   aiTestLoadingPanelUpdate,
@@ -24,6 +27,7 @@ import {
   settingsModuleFromValue,
   settingsPanelMessage,
   settingsPanelUpdate,
+  steamFreeSettingsModal,
   voiceSettingsModal
 } from "./control-panels.js";
 import type { PanelMessage, PanelUpdate } from "./discord-ui.js";
@@ -31,7 +35,8 @@ import { memberRoleIds } from "./discord-message-runtime.js";
 import { canUseSettings } from "./permissions.js";
 import {
   checkSteamFreeGames,
-  sendSteamFreeTestMessage
+  sendSteamFreeTestMessage,
+  type SteamFreeCheckResult
 } from "./steam-free-runtime.js";
 import type { Store } from "./store.js";
 import { DISCORD_ERROR_TEXT, safeMentions } from "./text.js";
@@ -47,93 +52,73 @@ export function selectedIdChanges(existingIds: string[], selectedIds: string[]):
   };
 }
 
-type PanelInteraction = {
-  user: { id: string };
-  message?: { id: string } | null;
-  fetchReply(): Promise<{ id: string }>;
-  deleteReply(): Promise<void>;
-};
 type ProviderModelRefreshInteraction = {
   update(options: PanelUpdate): Promise<unknown>;
   editReply(options: PanelUpdate): Promise<unknown>;
 };
 
-const CONTROL_PANEL_IDLE_DELETE_MS = 120_000;
-const panelDeleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-function isManager(interaction: Interaction, allowedUserIds: Set<string>, allowedRoleIds: Set<string>): boolean {
-  return allowedUserIds.has(interaction.user.id) || memberRoleIds(interaction.member).some((id) => allowedRoleIds.has(id));
+function isManager(interaction: Interaction, allowedUserIds: Set<string> | undefined, allowedRoleIds: Set<string> | undefined, config: Config, scope: "admin" | "aiSettings"): boolean {
+  if (Boolean(allowedUserIds?.has(interaction.user.id))) return true;
+  if (!roleScopeIsValid(config, scope)) return false;
+  return memberRoleIds(interaction.member).some((id) => Boolean(allowedRoleIds?.has(id)));
 }
 
-function canUseSettingsInteraction(interaction: Interaction, store: Store): boolean {
+function canUseSettingsInteraction(interaction: Interaction, store: Store, config: Config): boolean {
+  const isAdmin = isManager(interaction, config.adminUserIds, config.adminRoleIds, config, "admin");
+  if (isAdmin) return true;
+  if (store.isSettingsAccessBlocked()) return false;
   return canUseSettings({
     memberRoleIds: memberRoleIds(interaction.member),
     settingsRoleIds: new Set(store.listSettingsAllowedRoles())
   });
 }
 
-export function controlPanelTimerKey(userId: string, messageId: string): string {
-  return `${userId}:${messageId}`;
+function canManageAiSettings(interaction: Interaction, config: Config): boolean {
+  if (config.aiSettingsUserIds.has(interaction.user.id) || config.adminUserIds.has(interaction.user.id)) return true;
+  const roles = memberRoleIds(interaction.member);
+  return (roleScopeIsValid(config, "aiSettings") && roles.some((id) => config.aiSettingsRoleIds.has(id))) ||
+    (roleScopeIsValid(config, "admin") && roles.some((id) => config.adminRoleIds.has(id)));
 }
 
-async function resetControlPanelDeleteTimer(interaction: PanelInteraction): Promise<void> {
-  let messageId = interaction.message?.id;
-  if (!messageId) {
-    try {
-      messageId = (await interaction.fetchReply()).id;
-    } catch {
-      return;
-    }
-  }
-  const key = controlPanelTimerKey(interaction.user.id, messageId);
-  const oldTimer = panelDeleteTimers.get(key);
-  if (oldTimer) clearTimeout(oldTimer);
-  const timer = setTimeout(() => {
-    panelDeleteTimers.delete(key);
-    void interaction.deleteReply().catch(() => undefined);
-  }, CONTROL_PANEL_IDLE_DELETE_MS);
-  timer.unref?.();
-  panelDeleteTimers.set(key, timer);
+function isThreadSelection(interaction: Interaction, channelId: string): boolean {
+  const channel = interaction.guild?.channels.cache.get(channelId);
+  return Boolean(channel && typeof (channel as { isThread?: () => boolean }).isThread === "function" &&
+    (channel as { isThread: () => boolean }).isThread());
 }
 
 async function handleChatInput(interaction: ChatInputCommandInteraction, store: Store, config: Config): Promise<void> {
   if (interaction.commandName === "settings") {
-    if (!canUseSettingsInteraction(interaction, store)) {
+    if (!canUseSettingsInteraction(interaction, store, config)) {
       await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.reply(settingsPanelMessage(interaction, store, config));
-    await resetControlPanelDeleteTimer(interaction);
     return;
   }
 
   if (interaction.commandName === "admin") {
-    if (!isManager(interaction, config.adminUserIds, config.adminRoleIds)) {
+    if (!isManager(interaction, config.adminUserIds, config.adminRoleIds, config, "admin")) {
       await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/admin"), flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.reply(adminPanelMessage(interaction, store, config));
-    await resetControlPanelDeleteTimer(interaction);
     return;
   }
 
   if (interaction.commandName !== "ai-settings") return;
-  if (!isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
+  if (!canManageAiSettings(interaction, config)) {
     await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
     return;
   }
   await interaction.reply(aiSettingsPanelMessage(interaction, store, config));
-  await resetControlPanelDeleteTimer(interaction);
 }
 
 async function respondPanel(interaction: ModalSubmitInteraction, message: PanelMessage, update: PanelUpdate): Promise<void> {
   if (interaction.isFromMessage()) {
     await interaction.update(update);
-    await resetControlPanelDeleteTimer(interaction);
     return;
   }
   await interaction.reply(message);
-  await resetControlPanelDeleteTimer(interaction);
 }
 
 async function refreshProviderModelOptions(interaction: ProviderModelRefreshInteraction, store: Store, config: Config, page = 0): Promise<void> {
@@ -203,25 +188,83 @@ async function handleVoiceSettingsModal(interaction: ModalSubmitInteraction, sto
   );
 }
 
+async function handleAiLimitsModal(interaction: ModalSubmitInteraction, store: Store, config: Config): Promise<void> {
+  const actor = { id: interaction.user.id, name: interaction.user.username };
+  const fields: Array<[string, string, number, number, string]> = [
+    ["ai-cooldown-seconds", "ai_cooldown_seconds", 1, 60, "冷卻秒數"],
+    ["ai-max-in-flight", "ai_max_in_flight", 1, 10, "同時處理數"],
+    ["ai-queue-max", "ai_queue_max", 1, 10, "佇列上限"],
+    ["ai-queue-timeout-seconds", "ai_queue_timeout_seconds", 30, 300, "佇列逾時秒數"]
+  ];
+  const values: Record<string, string> = {};
+  const problems: string[] = [];
+  for (const [fieldId, key, minimum, maximum, label] of fields) {
+    const parsed = parseIntegerInput(interaction.fields.getTextInputValue(fieldId), minimum, maximum);
+    if (parsed === null || parsed === undefined) {
+      problems.push(label + "需為 " + minimum + "-" + maximum + " 的整數");
+    } else {
+      values[key] = String(parsed);
+    }
+  }
+  const extra = interaction.fields.getTextInputValue("ai-runtime-extra").split(",").map((value) => value.trim());
+  if (extra.length !== 3) {
+    problems.push("上下文/附件 MB/回應字數需填 3 個逗號分隔整數");
+  } else {
+    const extraFields: Array<[string, number, number, string]> = [
+      ["ai_recent_context_limit", 1, 50, "近期上下文則數"],
+      ["attachment_max_mb", 1, 25, "附件 MB"],
+      ["ai_response_max_chars", 2_000, 12_000, "回應字數"]
+    ];
+    for (const [index, [key, minimum, maximum, label]] of extraFields.entries()) {
+      const parsed = parseIntegerInput(extra[index] ?? "", minimum, maximum);
+      if (parsed === null || parsed === undefined) {
+        problems.push(label + "需為 " + minimum + "-" + maximum + " 的整數");
+      } else {
+        values[key] = String(parsed);
+      }
+    }
+  }
+  if (problems.length) {
+    await interaction.reply({ content: "AI 限制未變更： " + problems.join("；"), flags: MessageFlags.Ephemeral });
+    return;
+  }
+  try {
+    store.setRuntimeSettings(values, actor);
+  } catch {
+    await interaction.reply({ content: "AI 限制未變更：驗證失敗。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await respondPanel(
+    interaction,
+    aiSettingsPanelMessage(interaction, store, config, "limits"),
+    aiSettingsPanelUpdate(interaction, store, config, "limits")
+  );
+}
+
+function steamCheckNotice(result: SteamFreeCheckResult): string {
+  if (result.outcome === "error") return "檢查失敗 · " + (result.errorCode ?? "STEAM-CHECK-001");
+  if (result.outcome === "notified") return `找到 ${result.found} 個，已通知 ${result.notified} 個`;
+  if (result.outcome === "found") return `找到 ${result.found} 個，沒有新通知`;
+  return "沒有新遊戲變更";
+}
+
 async function handlePanelInteraction(interaction: Interaction, store: Store, config: Config): Promise<boolean> {
   if (!interaction.isButton() && !interaction.isRoleSelectMenu() && !interaction.isChannelSelectMenu() && !interaction.isStringSelectMenu()) return false;
   const customId = interaction.customId;
   if (!customId.startsWith("ai:") && !customId.startsWith("admin:") && !customId.startsWith("settings:")) return false;
 
-  if (customId.startsWith("admin:") && !isManager(interaction, config.adminUserIds, config.adminRoleIds)) {
+  if (customId.startsWith("admin:") && !isManager(interaction, config.adminUserIds, config.adminRoleIds, config, "admin")) {
     await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/admin"), flags: MessageFlags.Ephemeral });
     return true;
   }
-  if (customId.startsWith("ai:") && !isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
+  if (customId.startsWith("ai:") && !canManageAiSettings(interaction, config)) {
     await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
     return true;
   }
-  if (customId.startsWith("settings:") && !canUseSettingsInteraction(interaction, store)) {
+  if (customId.startsWith("settings:") && !canUseSettingsInteraction(interaction, store, config)) {
     await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
     return true;
   }
-
-  await resetControlPanelDeleteTimer(interaction);
 
   const actor = { id: interaction.user.id, name: interaction.user.username };
   if (interaction.isButton()) {
@@ -240,14 +283,20 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
       await interaction.update(settingsPanelUpdate(interaction, store, config, "steam-free"));
       return true;
     }
+    if (customId === "settings:steam-free:options") {
+      await interaction.showModal(steamFreeSettingsModal(store));
+      return true;
+    }
     if (customId === "settings:steam-free:check") {
       await interaction.update(settingsPanelUpdate(interaction, store, config, "steam-free"));
+      let result: SteamFreeCheckResult;
       try {
-        await checkSteamFreeGames(interaction.client, store);
+        result = await checkSteamFreeGames(interaction.client, store);
       } catch (error) {
         console.error(error);
+        result = { found: 0, notified: 0, outcome: "error", errorCode: "STEAM-CHECK-001" };
       }
-      await interaction.editReply(settingsPanelUpdate(interaction, store, config, "steam-free"));
+      await interaction.editReply(settingsPanelUpdate(interaction, store, config, "steam-free", steamCheckNotice(result)));
       return true;
     }
     if (customId === "settings:steam-free:test") {
@@ -270,11 +319,11 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
       return true;
     }
     if (customId === "admin:ai") {
-      if (!isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
-        await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
-        return true;
-      }
       await interaction.update(aiSettingsPanelUpdate(interaction, store, config));
+      return true;
+    }
+    if (customId === "ai:limits:edit") {
+      await interaction.showModal(aiLimitsModal(store));
       return true;
     }
     if (customId === "ai:test") {
@@ -315,6 +364,15 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
     await interaction.update(adminPanelUpdate(interaction, store, config, module));
     return true;
   }
+  if (interaction.isStringSelectMenu() && customId === "ai:module") {
+    if (typeof (store as unknown as { setting?: unknown }).setting !== "function") {
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.aiPanelSimplified, flags: MessageFlags.Ephemeral });
+      return true;
+    }
+    const module = aiSettingsModuleFromValue(interaction.values[0] ?? "") ?? "overview";
+    await interaction.update(aiSettingsPanelUpdate(interaction, store, config, module));
+    return true;
+  }
   if (interaction.isStringSelectMenu() && customId === "settings:module") {
     const module = settingsModuleFromValue(interaction.values[0] ?? "") ?? "overview";
     await interaction.update(settingsPanelUpdate(interaction, store, config, module));
@@ -350,6 +408,36 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
     await interaction.update(settingsPanelUpdate(interaction, store, config, "steam-free"));
     return true;
   }
+  if (interaction.isChannelSelectMenu() && customId === "ai:access:channels") {
+    if (interaction.values.some((id) => isThreadSelection(interaction, id))) {
+      await interaction.reply({ content: "AI 不允許使用 Thread，請選擇一般文字頻道。", flags: MessageFlags.Ephemeral });
+      return true;
+    }
+    const current = store.listAllowedChannels();
+    const changes = selectedIdChanges(current, interaction.values);
+    const nextCount = current.length - changes.remove.length + changes.add.length;
+    if (nextCount > 25) {
+      await interaction.reply({ content: "AI 允許頻道最多只能保留 25 個。", flags: MessageFlags.Ephemeral });
+      return true;
+    }
+    for (const id of changes.remove) store.removeChannel(id, actor);
+    for (const id of changes.add) store.addChannel(id, actor);
+    await interaction.update(aiSettingsPanelUpdate(interaction, store, config, "access"));
+    return true;
+  }
+  if (interaction.isRoleSelectMenu() && customId === "ai:access:roles") {
+    const current = store.listAllowedRoles();
+    const changes = selectedIdChanges(current, interaction.values);
+    const nextCount = current.length - changes.remove.length + changes.add.length;
+    if (nextCount > 25) {
+      await interaction.reply({ content: "AI 允許身分組最多只能保留 25 個。", flags: MessageFlags.Ephemeral });
+      return true;
+    }
+    for (const id of changes.remove) store.removeRole(id, actor);
+    for (const id of changes.add) store.addRole(id, actor);
+    await interaction.update(aiSettingsPanelUpdate(interaction, store, config, "access"));
+    return true;
+  }
   if (interaction.isRoleSelectMenu() && customId === "settings:steam-free:roles") {
     store.setSteamFreeSetting("notify_role_ids", interaction.values.join(","), actor);
     await interaction.update(settingsPanelUpdate(interaction, store, config, "steam-free"));
@@ -373,6 +461,18 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
     try {
       const options = await fetchAiModelOptions(config);
       if (selected && selected !== currentModel && options.some((option) => option.value === selected)) {
+        try {
+          await canaryAiModel(config, selected);
+        } catch (error) {
+          const normalized = aiError(error);
+          const keyState = readNineRouterKeyState(config.databasePath);
+          await interaction.editReply(aiProviderStatusPanelUpdate(
+            `模型 canary 失敗（${normalized.userCode}），未變更設定。`,
+            keyState,
+            store.setting("ai_9router_key_id") ?? ""
+          ));
+          return true;
+        }
         store.setRuntimeSetting("ai_model", selected, actor);
       }
       const keyState = readNineRouterKeyState(config.databasePath);
@@ -412,15 +512,44 @@ export async function handleInteraction(interaction: Interaction, store: Store, 
     return;
   }
   if (interaction.isModalSubmit() && interaction.customId === "settings:voice-modal") {
-    if (!canUseSettingsInteraction(interaction, store)) {
+    if (!canUseSettingsInteraction(interaction, store, config)) {
       await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
       return;
     }
     await handleVoiceSettingsModal(interaction, store, config);
     return;
   }
+  if (interaction.isModalSubmit() && interaction.customId === "settings:steam-free-modal") {
+    if (!canUseSettingsInteraction(interaction, store, config)) {
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/settings"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const interval = parseIntegerInput(interaction.fields.getTextInputValue("steam-free-interval"), 15, 180);
+    if (interval === null || interval === undefined) {
+      await interaction.reply({
+        content: "Steam 檢查間隔未變更：請填 15-180 的整數。",
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+    store.setSteamFreeSetting("interval_minutes", String(interval), { id: interaction.user.id, name: interaction.user.username });
+    await respondPanel(
+      interaction,
+      settingsPanelMessage(interaction, store, config, "steam-free"),
+      settingsPanelUpdate(interaction, store, config, "steam-free")
+    );
+    return;
+  }
+  if (interaction.isModalSubmit() && interaction.customId === "ai:limits-modal") {
+    if (!canManageAiSettings(interaction, config)) {
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await handleAiLimitsModal(interaction, store, config);
+    return;
+  }
   if (interaction.isModalSubmit() && interaction.customId.startsWith("ai:")) {
-    if (!isManager(interaction, config.aiSettingsUserIds, config.aiSettingsRoleIds)) {
+    if (!canManageAiSettings(interaction, config)) {
       await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
       return;
     }

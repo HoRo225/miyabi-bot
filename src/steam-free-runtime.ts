@@ -1,4 +1,5 @@
 import {
+  ChannelType,
   MessageFlags,
   type APIMessageTopLevelComponent,
   type Client
@@ -15,6 +16,7 @@ import {
 import {
   parseSteamFreeAppClaimUntilAt,
   parseSteamFreeSearchResponse,
+  steamFreeIntervalMinutes,
   steamFreeItemExpired,
   steamFreeNotificationTitle,
   steamFreePriceText,
@@ -24,23 +26,69 @@ import { Store, now, type SteamFreeSeenItem } from "./store.js";
 import { discordTimestampText, inlineCodeText, safeMentions } from "./text.js";
 
 const STEAM_FREE_SEARCH_URL = "https://store.steampowered.com/search/results/?query&start=0&count=50&dynamic_data=&sort_by=_ASC&maxprice=free&category1=998&specials=1&infinite=1&cc=tw&l=tchinese";
-const STEAM_FREE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const STEAM_FREE_CHANNEL_SCAN_LIMIT = 100;
 const STEAM_RETRY_MAX_DELAY_MS = 30_000;
+const STEAM_FREE_CHANNEL_ERROR_CODE = "STEAM-CHANNEL-001";
+const STEAM_FREE_CHECK_ERROR_CODE = "STEAM-CHECK-001";
+const STEAM_ACCESS_BLOCKED_ERROR_CODE = "DISCORD-ID-002";
 
+export type SteamFreeCheckOutcome = "found" | "notified" | "no-change" | "error";
+
+export type SteamFreeCheckResult = {
+  found: number;
+  notified: number;
+  outcome: SteamFreeCheckOutcome;
+  errorCode?: string;
+
+};
 // ponytail: one bot process needs one Steam check; split per guild only if this becomes multi-tenant.
-let steamFreeCheckInFlight: Promise<{ found: number; notified: number }> | null = null;
+export type SteamFreeRuntimeStatus = {
+  module: "steam";
+  state: "ready" | "disabled" | "degraded";
+  lastSuccessAt: string | null;
+  lastErrorAt: string | null;
+  errorCode: string | null;
+};
 
-type SteamFreeRuntimeStore = Pick<Store,
+let steamFreeStatusState: SteamFreeRuntimeStatus = {
+  module: "steam",
+  state: "disabled",
+  lastSuccessAt: null,
+  lastErrorAt: null,
+  errorCode: null
+};
+
+export function steamFreeRuntimeStatus(): SteamFreeRuntimeStatus {
+  return { ...steamFreeStatusState };
+}
+
+function setSteamFreeStatus(state: SteamFreeRuntimeStatus["state"], errorCode: string | null = null): void {
+  const timestamp = now();
+  steamFreeStatusState = {
+    ...steamFreeStatusState,
+    state,
+    ...(state === "ready" ? { lastSuccessAt: timestamp } : {}),
+    ...(state === "degraded" ? { lastErrorAt: timestamp } : {}),
+    errorCode
+  };
+}
+let steamFreeCheckInFlight: Promise<SteamFreeCheckResult> | null = null;
+
+export type SteamFreeRuntimeStore = Pick<Store,
   | "markSteamFreeExpired"
   | "markSteamFreeSeen"
   | "seenSteamFreeItemIds"
   | "setSteamFreeSetting"
   | "steamFreeSeenItemsToExpire"
   | "steamFreeSettings"
->;
+  | "isSteamAccessBlocked"
+> & {
+  steamFreeSetting?: (key: string) => string | undefined;
+};
 
 type SendableChannel = {
+  type?: ChannelType;
+  isThread?: () => boolean;
   send(options: unknown): Promise<unknown>;
 };
 type SteamFreeChannelMessage = {
@@ -71,17 +119,8 @@ async function fetchSteamFreeItems(): Promise<SteamFreeItem[]> {
 async function hydrateSteamFreeClaimUntilDates(items: SteamFreeItem[]): Promise<SteamFreeItem[]> {
   const hydrated: SteamFreeItem[] = [];
   for (const item of items) {
-    if (item.claimUntilAt) {
-      hydrated.push(item);
-      continue;
-    }
-    try {
-      const claimUntilAt = await fetchSteamFreeAppClaimUntilAt(item.appId);
-      hydrated.push(claimUntilAt ? { ...item, claimUntilAt } : item);
-    } catch (error) {
-      console.error(error);
-      hydrated.push(item);
-    }
+    const claimUntilAt = await fetchSteamFreeAppClaimUntilAt(item.appId);
+    if (claimUntilAt) hydrated.push({ ...item, claimUntilAt });
   }
   return hydrated;
 }
@@ -94,25 +133,44 @@ async function fetchSteamFreeAppClaimUntilAt(appId: string): Promise<string | nu
   return parseSteamFreeAppClaimUntilAt(await response.text());
 }
 
-export function checkSteamFreeGames(client: Client, store: SteamFreeRuntimeStore): Promise<{ found: number; notified: number }> {
+export function checkSteamFreeGames(client: Client, store: SteamFreeRuntimeStore): Promise<SteamFreeCheckResult> {
+  if (store.isSteamAccessBlocked()) return Promise.resolve(steamAccessBlockedResult());
   if (steamFreeCheckInFlight) return steamFreeCheckInFlight;
-  const task = checkSteamFreeGamesOnce(client, store).finally(() => {
+  const task = (async (): Promise<SteamFreeCheckResult> => {
+    try {
+      if (store.isSteamAccessBlocked()) return steamAccessBlockedResult();
+      const settings = store.steamFreeSettings();
+      if (!settings.enabled) {
+        setSteamFreeStatus("disabled");
+        return { found: 0, notified: 0, outcome: "no-change" };
+      }
+      const result = await checkSteamFreeGamesOnce(client, store);
+      if (result.outcome === "error") setSteamFreeStatus("degraded", result.errorCode ?? STEAM_FREE_CHECK_ERROR_CODE);
+      else setSteamFreeStatus("ready");
+      return result;
+    } catch (error) {
+      console.error(error);
+      setSteamFreeStatus("degraded", STEAM_FREE_CHECK_ERROR_CODE);
+      return { found: 0, notified: 0, outcome: "error", errorCode: STEAM_FREE_CHECK_ERROR_CODE };
+    }
+  })().finally(() => {
     if (steamFreeCheckInFlight === task) steamFreeCheckInFlight = null;
   });
   steamFreeCheckInFlight = task;
   return task;
 }
 
-async function checkSteamFreeGamesOnce(client: Client, store: SteamFreeRuntimeStore): Promise<{ found: number; notified: number }> {
+async function checkSteamFreeGamesOnce(client: Client, store: SteamFreeRuntimeStore): Promise<SteamFreeCheckResult> {
+  if (store.isSteamAccessBlocked()) return steamAccessBlockedResult();
   const settings = store.steamFreeSettings();
-  if (!settings.enabled || !settings.channelId) return { found: 0, notified: 0 };
+  if (!settings.enabled) return { found: 0, notified: 0, outcome: "no-change" };
+  if (!settings.channelId) return { found: 0, notified: 0, outcome: "error", errorCode: STEAM_FREE_CHANNEL_ERROR_CODE };
   const channel = await client.channels.fetch(settings.channelId).catch(() => null);
-  if (!isSteamFreeNotificationChannel(channel)) return { found: 0, notified: 0 };
+  if (!isSteamFreeNotificationChannel(channel)) return { found: 0, notified: 0, outcome: "error", errorCode: STEAM_FREE_CHANNEL_ERROR_CODE };
 
   await markExpiredSteamFreeNotifications(channel, store, settings.notifyRoleIds);
   const items = await fetchSteamFreeItems();
   const activeItems = items.filter((item) => !steamFreeItemExpired(item));
-  store.setSteamFreeSetting("last_checked_at", now());
   const seen = new Set(store.seenSteamFreeItemIds());
   const channelSnapshot = await fetchSteamFreeChannelMessages(channel, client.user?.id ?? null);
   const activeSnapshot = channelSnapshot?.filter((message) => !message.text.includes("(已過期)")) ?? null;
@@ -137,24 +195,74 @@ async function checkSteamFreeGamesOnce(client: Client, store: SteamFreeRuntimeSt
     seen.add(item.appId);
     notified += 1;
   }
-  return { found: items.length, notified };
+  store.setSteamFreeSetting("last_checked_at", now());
+  const outcome: SteamFreeCheckOutcome = notified > 0 ? "notified" : activeItems.length > 0 ? "found" : "no-change";
+  return { found: items.length, notified, outcome };
 }
 
-export function startSteamFreeWorker(client: Client, store: SteamFreeRuntimeStore): void {
+type SteamFreeWorker = {
+  stopped: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+  running: Promise<void> | null;
+  stop: () => Promise<void>;
+};
+
+let steamFreeWorker: SteamFreeWorker | null = null;
+
+export function startSteamFreeWorker(client: Client, store: SteamFreeRuntimeStore): () => Promise<void> {
+  if (steamFreeWorker) return steamFreeWorker.stop;
+  const worker: SteamFreeWorker = { stopped: false, timer: null, running: null, stop: async () => undefined };
+  const schedule = () => {
+    if (worker.stopped) return;
+    const minutes = steamFreeIntervalMinutes(store.steamFreeSetting?.("interval_minutes"));
+    worker.timer = setTimeout(() => {
+      worker.timer = null;
+      worker.running = tick();
+      void worker.running;
+    }, minutes * 60 * 1000);
+    worker.timer.unref?.();
+  };
   const tick = async () => {
     try {
+      if (store.isSteamAccessBlocked()) {
+        setSteamFreeStatus("degraded", STEAM_ACCESS_BLOCKED_ERROR_CODE);
+        return;
+      }
       await checkSteamFreeGames(client, store);
     } catch (error) {
       console.error(error);
+    } finally {
+      if (!worker.stopped) schedule();
     }
   };
-  const timer = setInterval(() => void tick(), STEAM_FREE_CHECK_INTERVAL_MS);
-  timer.unref?.();
-  void tick();
+  worker.stop = async () => {
+    worker.stopped = true;
+    if (worker.timer) clearTimeout(worker.timer);
+    await worker.running?.catch(() => undefined);
+    await steamFreeCheckInFlight?.catch(() => undefined);
+    if (steamFreeWorker === worker) steamFreeWorker = null;
+  };
+  steamFreeWorker = worker;
+  worker.running = tick();
+  void worker.running;
+  return worker.stop;
 }
 
-function isSteamFreeNotificationChannel(channel: unknown): channel is SendableChannel {
-  return typeof (channel as { send?: unknown } | null)?.send === "function";
+function steamAccessBlockedResult(): SteamFreeCheckResult {
+  setSteamFreeStatus("degraded", STEAM_ACCESS_BLOCKED_ERROR_CODE);
+  return { found: 0, notified: 0, outcome: "error", errorCode: STEAM_ACCESS_BLOCKED_ERROR_CODE };
+}
+
+export async function stopSteamFreeWorker(): Promise<void> {
+  const worker = steamFreeWorker;
+  if (worker) await worker.stop();
+}
+
+export function isSteamFreeNotificationChannel(channel: unknown): channel is SendableChannel {
+  const value = channel as { type?: unknown; isThread?: () => boolean; send?: unknown } | null;
+  if (typeof value?.send !== "function") return false;
+  if (typeof value.isThread === "function" && value.isThread()) return false;
+  return value.type === ChannelType.GuildText || value.type === ChannelType.GuildAnnouncement;
 }
 
 function isMessageHistoryChannel(channel: SendableChannel): channel is MessageHistoryChannel {
@@ -298,11 +406,15 @@ async function sendSteamFreeNotification(channel: SendableChannel, item: SteamFr
 }
 
 export async function sendSteamFreeTestMessage(client: Client, store: SteamFreeRuntimeStore): Promise<boolean> {
+  if (store.isSteamAccessBlocked()) {
+    setSteamFreeStatus("degraded", STEAM_ACCESS_BLOCKED_ERROR_CODE);
+    return false;
+  }
   const settings = store.steamFreeSettings();
   if (!settings.channelId) return false;
   const channel = await client.channels.fetch(settings.channelId).catch(() => null);
   if (!isSteamFreeNotificationChannel(channel)) return false;
-  await sendSteamFreeNotification(channel, steamFreeTestItem(), settings.notifyRoleIds);
+  await sendSteamFreeNotification(channel, steamFreeTestItem(), []);
   return true;
 }
 

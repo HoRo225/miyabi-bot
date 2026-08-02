@@ -44,6 +44,7 @@ test("expired Steam app can notify again in a later free campaign", () => {
 
 test("scheduled and manual Steam checks share one in-flight promise", async () => {
   const store: Parameters<typeof checkSteamFreeGames>[1] = {
+    isSteamAccessBlocked: () => false,
     steamFreeSettings: () => ({ enabled: false, channelId: null, lastCheckedAt: null, notifyRoleIds: [] }),
     seenSteamFreeItemIds: () => [],
     markSteamFreeSeen: () => false,
@@ -55,5 +56,5 @@ test("scheduled and manual Steam checks share one in-flight promise", async () =
   const first = checkSteamFreeGames(client, store);
   const second = checkSteamFreeGames(client, store);
   assert.equal(first, second);
-  assert.deepEqual(await first, { found: 0, notified: 0 });
+  assert.deepEqual(await first, { found: 0, notified: 0, outcome: "no-change" });
 });

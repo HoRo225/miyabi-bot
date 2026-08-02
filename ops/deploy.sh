@@ -21,6 +21,25 @@ trap cleanup EXIT
 [ "$#" -eq 0 ] || { echo "usage: deploy.sh" >&2; exit 2; }
 cd "$root_dir"
 
+prepare_status_dir() {
+  status_dir="$root_dir/data/status"
+  [ ! -L "$status_dir" ] || { echo "data/status must not be a symlink" >&2; return 1; }
+  mkdir -p "$status_dir"
+  chmod 700 "$status_dir"
+  if [ "$(id -u)" -ne 1000 ] || [ "$(id -g)" -ne 1000 ]; then
+    chown 1000:1000 "$status_dir" || {
+      echo "data/status owner must be runtime uid 1000" >&2
+      return 1
+    }
+  fi
+  [ "$(stat -c '%u:%g' "$status_dir")" = 1000:1000 ] || {
+    echo "data/status owner must be runtime uid 1000" >&2
+    return 1
+  }
+}
+
+prepare_status_dir
+
 compose() {
   "$docker_bin" compose "$@"
 }

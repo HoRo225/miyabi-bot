@@ -49,6 +49,7 @@ test("AI output chunks are bounded, mention-safe, URL-free, and fully indexed", 
     setting: (key: string) => settings.get(key),
     listAllowedChannels: () => ["channel"],
     listAllowedRoles: () => [],
+    isAiAccessBlocked: () => false,
     aiResponseChain: () => undefined,
     logAiRequest: (input: Record<string, unknown>) => {
       requestLog = input;

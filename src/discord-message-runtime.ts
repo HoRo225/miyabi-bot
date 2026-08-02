@@ -3,7 +3,7 @@ import {
   type Interaction,
   type Message
 } from "discord.js";
-import { resolveAiEnabledSetting, type Config } from "./config.js";
+import { resolveAiEnabledSetting, roleScopeIsValid, type Config } from "./config.js";
 import { canUseAi, type AiAccess } from "./permissions.js";
 import type { Store } from "./store.js";
 
@@ -34,15 +34,19 @@ export function isMessageThread(message: Message): boolean {
 }
 
 export function aiAccessForMessage(message: Message, store: Store, config: Config): AiAccess {
+  if (store.isAiAccessBlocked()) return { ok: false, reason: "channel" };
   if (isMessageThread(message)) return { ok: false, reason: "channel" };
   if (!aiEnabled(store)) return { ok: false, reason: "disabled" };
   const channelIds = channelScopeIds(message.channelId, parentChannelId(message.channel));
   const channelAllowed = channelIds.some((id) => store.listAllowedChannels().includes(id));
   if (!channelAllowed) return { ok: false, reason: "channel" };
   const roles = memberRoleIds(message.member);
-  if (config.adminUserIds.has(message.author.id) || roles.some((roleId) => config.adminRoleIds.has(roleId))) {
+  if (config.adminUserIds.has(message.author.id) || config.aiSettingsUserIds.has(message.author.id)) {
     return { ok: true };
   }
+  const adminRoleAllowed = roleScopeIsValid(config, "admin") && roles.some((roleId) => config.adminRoleIds.has(roleId));
+  const aiSettingsRoleAllowed = roleScopeIsValid(config, "aiSettings") && roles.some((roleId) => config.aiSettingsRoleIds.has(roleId));
+  if (adminRoleAllowed || aiSettingsRoleAllowed) return { ok: true };
   return canUseAi({
     channelIds,
     userId: message.author.id,
@@ -50,6 +54,6 @@ export function aiAccessForMessage(message: Message, store: Store, config: Confi
     allowedChannelIds: new Set(store.listAllowedChannels()),
     allowedRoleIds: new Set(store.listAllowedRoles()),
     aiSettingsUserIds: config.aiSettingsUserIds,
-    aiSettingsRoleIds: config.aiSettingsRoleIds
+    aiSettingsRoleIds: aiSettingsRoleAllowed ? config.aiSettingsRoleIds : new Set()
   });
 }

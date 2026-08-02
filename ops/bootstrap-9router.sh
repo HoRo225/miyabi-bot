@@ -75,7 +75,7 @@ set_env_secret() {
   value=$2
   [ -f .env ] || {
     printf '.env is required.\n' >&2
-    exit 1
+    return 1
   }
   tmp=.env.secret.$$
   umask 077
@@ -90,10 +90,12 @@ set_env_secret() {
     END { if (!written) print name "=" value }
   ' > "$tmp"; then
     rm -f "$tmp"
-    exit 1
+    return 1
   fi
-  chmod 600 "$tmp"
-  mv "$tmp" .env
+  if ! chmod 600 "$tmp" || ! mv "$tmp" .env; then
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 write_key_metadata() {
@@ -112,6 +114,56 @@ write_key_metadata() {
   mv "$tmp" data/9router-api-keys.json
 }
 
+STATUS_DIR=${STATUS_DIR:-data/status}
+STATUS_PATH=${STATUS_PATH:-$STATUS_DIR/key-sync.json}
+
+status_timestamp() {
+  sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p' "$STATUS_PATH" 2>/dev/null | head -n 1
+}
+
+write_module_status() {
+  state=$1
+  error_code=${2:-}
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  previous_success=$(status_timestamp lastSuccessAt || true)
+  previous_error=$(status_timestamp lastErrorAt || true)
+  if [ "$state" = ready ]; then
+    success_json="\"$now\""
+    if [ -n "$previous_error" ]; then
+      error_json="\"$previous_error\""
+    else
+      error_json=null
+    fi
+    code_json=null
+  else
+    if [ -n "$previous_success" ]; then
+      success_json="\"$previous_success\""
+    else
+      success_json=null
+    fi
+    error_json="\"$now\""
+    code_json="\"${error_code:-KEY-SYNC-001}\""
+  fi
+  [ ! -L "$STATUS_DIR" ] || return 1
+  mkdir -p "$STATUS_DIR" || return 1
+  chmod 700 "$STATUS_DIR" || return 1
+  umask 077
+  tmp="$STATUS_PATH.$$"
+  [ ! -L "$STATUS_PATH" ] || return 1
+  [ ! -L "$tmp" ] || return 1
+  if ! printf '{"module":"key-sync","state":"%s","lastSuccessAt":%s,"lastErrorAt":%s,"errorCode":%s}\n' \
+    "$state" "$success_json" "$error_json" "$code_json" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  if ! mv "$tmp" "$STATUS_PATH"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 600 "$STATUS_PATH"
+}
+
 sync_bot_api_key() {
   SYNCED_KEY_CHANGED=0
   api_host=$1
@@ -122,8 +174,9 @@ sync_bot_api_key() {
     db.close();
     process.stdout.write(JSON.stringify(rows));
   ') || {
+    write_module_status degraded KEY-SYNC-001 || true
     printf '無法讀取 9router key metadata。\n' >&2
-    exit 1
+    return 1
   }
   selected_id=$(docker compose exec -T bot-prod node --no-warnings -e '
     const { DatabaseSync } = require("node:sqlite");
@@ -134,8 +187,9 @@ sync_bot_api_key() {
   ' 2>/dev/null || true)
   if [ -n "$selected_id" ] && ! printf '%s' "$selected_id" | grep -Eq '^[0-9a-fA-F-]{36}$'; then
     write_key_metadata "$keys_json" ""
+    write_module_status degraded KEY-SYNC-001 || true
     printf 'Discord AI 設定中的 9router key ID 格式無效。\n' >&2
-    exit 1
+    return 1
   fi
   chosen_id=$(docker compose exec -T 9router node --no-warnings -e '
     const { DatabaseSync } = require("node:sqlite");
@@ -148,8 +202,9 @@ sync_bot_api_key() {
     process.stdout.write(row.id);
   ' "$selected_id") || {
     write_key_metadata "$keys_json" ""
+    write_module_status degraded KEY-SYNC-001 || true
     printf '請先在 Discord /ai-settings 選擇一個 active 9router key。\n' >&2
-    exit 1
+    return 1
   }
   api_key=$(docker compose exec -T 9router node --no-warnings -e '
     const { DatabaseSync } = require("node:sqlite");
@@ -160,20 +215,23 @@ sync_bot_api_key() {
     process.stdout.write(row.key);
   ' "$chosen_id") || {
     write_key_metadata "$keys_json" ""
+    write_module_status degraded KEY-SYNC-001 || true
     printf '選擇的 9router key 已不存在或停用。\n' >&2
-    exit 1
+    return 1
   }
   if ! printf '%s' "$api_key" | grep -Eq '^sk-[a-z0-9-]{8,}$'; then
     api_key=
+    write_module_status degraded KEY-SYNC-001 || true
     printf '9router key 格式驗證失敗。\n' >&2
-    exit 1
+    return 1
   fi
   code=$(curl --silent --output /dev/null --write-out '%{http_code}' --max-time 10 \
     -H "Authorization: Bearer $api_key" "http://$api_host:20128/v1/models" || true)
   [ "$code" = 200 ] || {
     api_key=
+    write_module_status degraded KEY-SYNC-001 || true
     printf '9router key 無法通過 /v1/models 驗證。\n' >&2
-    exit 1
+    return 1
   }
   write_key_metadata "$keys_json" "$chosen_id"
   keys_json=
@@ -183,12 +241,18 @@ sync_bot_api_key() {
   if [ "$api_key" = "$current_key" ]; then
     api_key=
     current_key=
+    write_module_status ready "" || return 1
     return 0
   fi
   current_key=
-  set_env_secret AI_API_KEY "$api_key"
+  if ! set_env_secret AI_API_KEY "$api_key"; then
+    api_key=
+    write_module_status degraded KEY-SYNC-001 || true
+    return 1
+  fi
   api_key=
   SYNCED_KEY_CHANGED=1
+  write_module_status ready "" || return 1
   printf '已自動同步 Discord 選擇的 9router client key 至 bot .env。\n'
 }
 
@@ -315,6 +379,7 @@ case "$MODE" in
         api_host=$LAN_ADDRESS
         ;;
       *)
+        write_module_status degraded KEY-SYNC-001 || true
         printf '無法同步：9router binding 不符合安全設定。\n' >&2
         exit 1
         ;;

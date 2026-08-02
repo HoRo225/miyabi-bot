@@ -83,6 +83,7 @@ test("AI runtime enforces FIFO admission and stop race safety", async () => {
     setting: (key: string) => settingValues[key],
     listAllowedChannels: () => ["channel"],
     listAllowedRoles: () => [],
+    isAiAccessBlocked: () => false,
     logAiRequest: () => ++requestLogId,
     recordAiResponseMessages: () => undefined,
     aiResponseChain: () => { aiResponseChainCalls += 1; return undefined; }

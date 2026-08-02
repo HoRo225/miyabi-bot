@@ -101,6 +101,7 @@ test("recent context includes only ordinary human text and successful bot text",
     setting: (key: string) => settings.get(key),
     listAllowedChannels: () => ["channel"],
     listAllowedRoles: () => [],
+    isAiAccessBlocked: () => false,
     aiResponseChain: (id: string) => id === "bot-valid"
       ? { requestLogId: 1, sourceMessageId: "human-valid", channelId: "channel", responseMessageIds: ["bot-valid"] }
       : id === "reply-bot"

@@ -121,6 +121,7 @@ write_env() {
 
 reset_case() {
   rm -f "$test_root/build-started" "$test_root/mock.log"
+  rm -rf "$test_root/data/status"
   : > "$test_root/mock.log"
   printf '%s\n' "$current" > "$test_root/active-image"
   rm -f "$test_root"/.env.tmp.*
@@ -159,6 +160,12 @@ assert_no_env_temp() {
   for path in "$test_root"/.env.tmp.*; do
     [ ! -e "$path" ] || { echo "temporary env remains" >&2; exit 1; }
   done
+}
+
+assert_status_dir() {
+  [ -d "$test_root/data/status" ] || { echo "status directory missing" >&2; exit 1; }
+  [ "$(stat -c '%a' "$test_root/data/status")" = 700 ] || { echo "status directory mode is not 700" >&2; exit 1; }
+  [ "$(stat -c '%u:%g' "$test_root/data/status")" = 1000:1000 ] || { echo "status directory owner is not runtime uid" >&2; exit 1; }
 }
 
 line_of() {
@@ -271,6 +278,7 @@ write_env
 reset_case
 printf 'before-success\n' > "$test_root/data/bot.sqlite"
 run_deploy >/dev/null
+assert_status_dir
 grep -qx "BOT_IMAGE=$candidate" "$test_root/.env"
 grep -qx "BOT_IMAGE_PREVIOUS=$current" "$test_root/.env"
 grep -q "build --build-arg VCS_REF=$sha -t $candidate ." "$test_root/mock.log"

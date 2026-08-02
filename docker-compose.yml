@@ -88,8 +88,10 @@ services:
       DATABASE_PATH: /app/data/bot.sqlite
       BACKUP_DIR: /backups
       BACKUP_KEEP: "${BACKUP_KEEP:-5}"
+      STATUS_DIR: /app/data/status
     volumes:
       - ./data:/app/data:ro
+      - ./data/status:/app/data/status
       - ./backups:/backups
     read_only: true
     tmpfs:

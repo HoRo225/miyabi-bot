@@ -13,6 +13,16 @@ export type SteamFreeSettings = {
   notifyRoleIds: string[];
 };
 
+export const STEAM_FREE_DEFAULT_INTERVAL_MINUTES = 30;
+export const STEAM_FREE_MIN_INTERVAL_MINUTES = 15;
+export const STEAM_FREE_MAX_INTERVAL_MINUTES = 180;
+
+export function steamFreeIntervalMinutes(value: string | undefined): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return STEAM_FREE_DEFAULT_INTERVAL_MINUTES;
+  return Math.min(STEAM_FREE_MAX_INTERVAL_MINUTES, Math.max(STEAM_FREE_MIN_INTERVAL_MINUTES, Math.round(parsed)));
+}
+
 export type SteamFreeItem = {
   appId: string;
   title: string;
@@ -51,7 +61,8 @@ export function parseSteamFreeSearchResponse(body: unknown): SteamFreeItem[] {
     const appId = htmlAttribute(row, "data-ds-appid");
     const href = htmlAttribute(row, "href");
     const discount = htmlAttribute(row, "data-discount");
-    if (!appId || !href || discount !== "100" || seen.has(appId) || !/\/app\/\d+\//.test(href)) continue;
+    const itemKey = htmlAttribute(row, "data-ds-itemkey");
+    if (!appId || !href || !itemKey || discount !== "100" || seen.has(appId) || !/^App_[0-9]+$/.test(itemKey) || !/\/app\/[0-9]+\//i.test(href)) continue;
 
     const title = textFromHtml(row.match(/<span\b[^>]*class="title"[^>]*>([\s\S]*?)<\/span>/i)?.[1] ?? "") || `Steam App ${appId}`;
     const originalPrice = textFromHtml(row.match(/<div\b[^>]*class="discount_original_price"[^>]*>([\s\S]*?)<\/div>/i)?.[1] ?? "") || null;
@@ -119,7 +130,7 @@ export function parseSteamFreeAppClaimUntilAt(html: string, nowDate = new Date()
 }
 
 function steamFreeClaimUntilTextToIso(text: string, nowDate: Date): string | null {
-  if (!/免費取得即可永久保留/.test(text)) return null;
+  if (!/(免費取得即可永久保留|free to keep forever|permanently yours|keep it forever)/i.test(text)) return null;
   const match = text.replace(/\s+/g, " ").match(/(?:(\d{4})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*(上午|下午|凌晨|中午)?\s*(\d{1,2})(?::(\d{2}))?/);
   if (!match) return null;
 
