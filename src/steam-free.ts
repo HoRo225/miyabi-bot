@@ -4,6 +4,7 @@ import {
   type EnvLike
 } from "./config.js";
 import { safeMentions } from "./text.js";
+import type { StatusKind } from "./discord-ui.js";
 
 export type SteamFreeSettings = {
   enabled: boolean;
@@ -34,9 +35,9 @@ export function resolveSteamFreeSettings(settings: EnvLike): SteamFreeSettings {
   };
 }
 
-export function steamFreeStatusLabel(settings: SteamFreeSettings): string {
-  if (!settings.enabled) return "關閉";
-  return settings.channelId ? "可用" : "未完成設定";
+export function steamFreeStatusLabel(settings: SteamFreeSettings): StatusKind {
+  if (!settings.enabled) return "off";
+  return settings.channelId ? "ready" : "warn";
 }
 
 export function parseSteamFreeSearchResponse(body: unknown): SteamFreeItem[] {

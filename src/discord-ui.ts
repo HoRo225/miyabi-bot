@@ -9,6 +9,37 @@ import {
 } from "discord.js";
 import { safeMentions } from "./text.js";
 
+export type StatusKind = "ready" | "warn" | "off" | "error";
+
+const STATUS_LABELS: Record<StatusKind, string> = {
+  ready: "🟢 正常",
+  warn: "🟡 需設定",
+  off: "⚫ 未啟用",
+  error: "🔴 斷線"
+};
+
+const STATUS_COLORS: Record<StatusKind, number> = {
+  ready: 0x3fb950,
+  warn: 0xd29922,
+  off: 0x4e5058,
+  error: 0xf85149
+};
+
+export function statusBadge(kind: StatusKind): string {
+  return STATUS_LABELS[kind];
+}
+
+export function statusColor(kind: StatusKind): number {
+  return STATUS_COLORS[kind];
+}
+
+export function worstStatus(kinds: StatusKind[]): StatusKind {
+  return kinds.reduce<StatusKind>((worst, kind) => {
+    const severity = { ready: 0, off: 1, warn: 2, error: 3 };
+    return severity[kind] > severity[worst] ? kind : worst;
+  }, "ready");
+}
+
 export type PanelMessage = Pick<InteractionReplyOptions, "allowedMentions" | "components" | "flags">;
 export type PanelUpdate = Pick<InteractionUpdateOptions, "allowedMentions" | "components">;
 export type ComponentJson = Record<string, unknown>;
@@ -31,10 +62,10 @@ export function panelUpdate(components: APIMessageTopLevelComponent[]): PanelUpd
   };
 }
 
-export function componentContainer(children: ComponentJson[], accentColor: number): APIMessageTopLevelComponent {
+export function componentContainer(children: ComponentJson[], accent: StatusKind): APIMessageTopLevelComponent {
   return {
     type: ComponentType.Container,
-    accent_color: accentColor,
+    accent_color: statusColor(accent),
     components: children
   } as unknown as APIMessageTopLevelComponent;
 }
