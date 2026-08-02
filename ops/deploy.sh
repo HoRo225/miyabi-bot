@@ -92,11 +92,11 @@ apply_image() {
 }
 
 write_images() {
-  current="$1"
-  previous="$2"
+  write_current_image="$1"
+  write_previous_image="$2"
   env_temp="$(mktemp "$root_dir/.env.tmp.XXXXXX")"
   if awk '$0 !~ /^BOT_IMAGE(_PREVIOUS)?=/' .env > "$env_temp" &&
-    printf 'BOT_IMAGE=%s\nBOT_IMAGE_PREVIOUS=%s\n' "$current" "$previous" >> "$env_temp" &&
+    printf 'BOT_IMAGE=%s\nBOT_IMAGE_PREVIOUS=%s\n' "$write_current_image" "$write_previous_image" >> "$env_temp" &&
     chmod 600 "$env_temp" &&
     mv "$env_temp" .env; then
     env_temp=
@@ -108,11 +108,11 @@ write_images() {
 }
 
 cleanup_images() {
-  current="$1"
-  previous="$2"
+  cleanup_current_image="$1"
+  cleanup_previous_image="$2"
   "$docker_bin" image ls --format '{{.Repository}}:{{.Tag}}' miyabi-bot |
   while IFS= read -r ref; do
-    case "$ref" in "$current"|"$previous") continue ;; esac
+    case "$ref" in "$cleanup_current_image"|"$cleanup_previous_image") continue ;; esac
     if valid_image "$ref"; then
       "$docker_bin" image rm "$ref" >/dev/null 2>&1 || true
     fi
