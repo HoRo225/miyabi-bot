@@ -12,7 +12,9 @@ export const DISCORD_ERROR_TEXT = {
   aiUnavailable: (code: string) => "🔴 AI 服務暫時不可用\n-# 錯誤代碼 " + code + "，請稍後再試。",
   channelDisabled: "⚫ 此頻道未啟用 AI\n-# 請管理員在 /settings 開啟。",
   aiDisabled: "⚫ AI 功能目前停用\n-# 請管理員在 /settings 確認設定。",
-  invalidVoiceSettings: "⚠️ 輸入無效\n-# 人數上限請填 0–99 整數；房主管理請填開啟或關閉。",
+  invalidVoiceSettings: (detail: string) => "⚠️ 輸入無效\n-# " + detail + "。",
+  invalidApiKeySelection: "⚠️ 選擇無效\n-# 這個 9router key 已不存在、停用，或超過安全選單上限。",
+  aiPanelSimplified: "⚫ 此按鈕已停用\n-# 請重新執行 /ai-settings 開啟最新面板。",
   interactionFailed: "🔴 操作失敗\n-# 請重新執行指令。"
 } as const;
 

@@ -174,8 +174,11 @@ async function handleVoiceSettingsModal(interaction: ModalSubmitInteraction, sto
   const userLimit = parseIntegerInput(interaction.fields.getTextInputValue("voice-user-limit"), 0, 99);
   const ownerManage = parseBooleanInput(interaction.fields.getTextInputValue("voice-owner-manage"));
   if (userLimit === null || ownerManage === null) {
+    const problems: string[] = [];
+    if (userLimit === null) problems.push("人數上限請填 0-99 之間的整數");
+    if (ownerManage === null) problems.push("房主管理請填「開啟」或「關閉」");
     await interaction.reply({
-      content: DISCORD_ERROR_TEXT.invalidVoiceSettings,
+      content: DISCORD_ERROR_TEXT.invalidVoiceSettings(problems.join("；")),
       flags: MessageFlags.Ephemeral
     });
     return;
@@ -339,7 +342,7 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
     const selected = interaction.values[0]?.trim() ?? "";
     const keyState = readNineRouterKeyState(config.databasePath);
     if (!keyState.keys.some((key) => key.id === selected) || keyState.overflow) {
-      await interaction.reply({ content: "這個 9router key 已不存在、停用或超過安全選單上限。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: DISCORD_ERROR_TEXT.invalidApiKeySelection, flags: MessageFlags.Ephemeral });
       return true;
     }
     store.setRuntimeSetting("ai_9router_key_id", selected, actor);
@@ -375,7 +378,7 @@ async function handlePanelInteraction(interaction: Interaction, store: Store, co
   }
 
   if (customId.startsWith("ai:")) {
-    await interaction.reply({ content: "此 AI 設定面板已簡化，請重新執行 /ai-settings。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: DISCORD_ERROR_TEXT.aiPanelSimplified, flags: MessageFlags.Ephemeral });
     return true;
   }
 
@@ -404,7 +407,7 @@ export async function handleInteraction(interaction: Interaction, store: Store, 
       await interaction.reply({ content: DISCORD_ERROR_TEXT.permission("/ai-settings"), flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.reply({ content: "此 AI 設定面板已簡化，請重新執行 /ai-settings。", flags: MessageFlags.Ephemeral });
+    await interaction.reply({ content: DISCORD_ERROR_TEXT.aiPanelSimplified, flags: MessageFlags.Ephemeral });
     return;
   }
 }

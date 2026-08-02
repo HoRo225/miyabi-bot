@@ -335,7 +335,7 @@ function aiSettingsPanelComponents(store: ControlPanelStore, config: Config): AP
     textDisplay([
       "### 連線",
       "狀態 · " + statusBadge(connectionStatus),
-      connectionStatus === "ready" ? "-# Endpoint 與 API key 由 server 環境設定" : "說明 · 暫時無法讀取模型清單"
+      connectionStatus === "ready" ? "-# Endpoint 與 API key 由 server 環境設定" : "-# server 尚未設定 Endpoint 與 API key"
     ].join("\n")),
     textDisplay(modelLines.join("\n")),
     ...aiKeySelectionComponents(keyState, selectedKeyId),
@@ -361,7 +361,7 @@ function aiModelLoadingPanelComponents(currentModel: string): APIMessageTopLevel
     separator(),
     textDisplay([
       "### 連線",
-      "狀態 · " + statusBadge("warn"),
+      "狀態 · 🔄 處理中",
       "",
       "### 模型",
       "目前 · " + (currentModel ? inlineCodeText(currentModel) : statusBadge("warn"))
@@ -448,7 +448,7 @@ export function aiTestLoadingPanelUpdate(store: ControlPanelStore, config: Confi
     separator(),
     textDisplay([
       "### 測試連線",
-      "狀態 · " + statusBadge("warn"),
+      "狀態 · 🔄 處理中",
       "目前模型 · " + (model ? inlineCodeText(model) : statusBadge("warn"))
     ].join("\n"))
   ], "warn")]);
