@@ -22,11 +22,11 @@ user="$(id -u):$(id -g)"
 '
 
 source_hash="$(sha256sum "$data_dir/bot.sqlite" | awk '{print $1}')"
-for stamp in 20260101T000001Z 20260101T000002Z 20260101T000003Z 20260101T000004Z 20260101T000005Z; do
+for stamp in 20260101T000001Z 20260101T000002Z 20260101T000003Z 20260101T000004Z 20260101T000005Z 20260101T000006Z 20260101T000007Z 20260101T000008Z; do
   touch "$backup_dir/bot-$stamp.sqlite"
 done
 
-output="$("$docker_bin" run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m --user "$user" -e DATABASE_PATH=/app/data/bot.sqlite -e BACKUP_DIR=/backups -e BACKUP_KEEP=5 -e STATUS_DIR=/app/data/status -v "$data_dir:/app/data:ro" -v "$status_dir:/app/data/status" -v "$backup_dir:/backups" "$image" node /app/ops/backup.mjs)"
+output="$("$docker_bin" run --rm --network none --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev,size=16m --user "$user" -e DATABASE_PATH=/app/data/bot.sqlite -e BACKUP_DIR=/backups -e STATUS_DIR=/app/data/status -v "$data_dir:/app/data:ro" -v "$status_dir:/app/data/status" -v "$backup_dir:/backups" "$image" node /app/ops/backup.mjs)"
 backup_name="$(printf '%s\n' "$output" | tail -n 1 | sed 's#^/backups/##')"
 case "$backup_name" in bot-[0-9]*T[0-9]*Z.sqlite) ;; *) echo "invalid backup output" >&2; exit 1 ;; esac
 [ -f "$backup_dir/$backup_name" ]
@@ -58,7 +58,7 @@ for path in "$backup_dir"/bot-*.sqlite; do
   [ -e "$path" ] || continue
   count=$((count + 1))
 done
-[ "$count" -eq 5 ]
+[ "$count" -eq 7 ]
 
 for path in "$backup_dir"/*.partial "$backup_dir"/*-wal "$backup_dir"/*-shm; do
   [ ! -e "$path" ] || { echo "backup sidecar remains: $path" >&2; exit 1; }
