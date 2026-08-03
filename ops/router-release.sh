@@ -528,8 +528,10 @@ EOF
       - "$initial_env"
 EOF
   fi
+  # Compose appends override `ports` onto the base list, so a plain entry would keep
+  # publishing 20128 and collide with the live router; !override replaces it.
   cat >> "$temporary" <<EOF
-    ports:
+    ports: !override
       - "127.0.0.1:$port:20128"
     volumes:
       - router-data:/app/data
