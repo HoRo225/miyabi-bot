@@ -922,7 +922,7 @@ perform_sync() {
 write_selected_client_key() {
   valid_uuid "$selected_client_key_id" || die 'selected client key id invalid'
   [ "$dry_run" = 1 ] && return 0
-  compose_active exec -T bot-prod node --no-warnings -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync("/app/data/bot.sqlite"); db.prepare("INSERT INTO ai_runtime_settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run("ai_9router_key_id",process.argv[1]); db.close();' "$selected_client_key_id" || return 1
+  compose_active exec -T bot-prod node --no-warnings -e 'const {DatabaseSync}=require("node:sqlite"); const db=new DatabaseSync("/app/data/bot.sqlite"); db.prepare("INSERT INTO ai_runtime_settings(key,value,updated_by,updated_at) VALUES(?,?,NULL,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by, updated_at=excluded.updated_at").run("ai_9router_key_id",process.argv[1],new Date().toISOString()); db.close();' "$selected_client_key_id" || return 1
 }
 production_validate() {
   [ "$dry_run" = 1 ] && return
@@ -1026,11 +1026,6 @@ rollback_locked() {
   prod_stopped=1
   if ! compose_active stop 9router bot-prod >/dev/null 2>&1; then prod_stopped=0; rollback_error=1; fi
   health_deadline_ok || rollback_error=1
-  if [ -n "${candidate_volume:-}" ] && volume_exists "$candidate_volume"; then
-    remove_volume_exact "$candidate_volume" || rollback_error=1
-    [ "$rollback_error" -ne 0 ] || { volume_swapped=0; manifest_set volume_swapped 0 || rollback_error=1; }
-  fi
-  health_deadline_ok || rollback_error=1
   if [ "$prod_stopped" -eq 1 ]; then
     restore_database || rollback_error=1
   fi
@@ -1038,6 +1033,13 @@ rollback_locked() {
   preserve_discord_token || rollback_error=1
   health_deadline_ok || rollback_error=1
   if ! apply_router_image "$old_router_image" "$old_volume"; then rollback_error=1; fi
+  # The production router only drops its reference to the candidate volume once it
+  # has been recreated on the old volume; removing it earlier always reports the
+  # stopped-but-present container as a reference and fails the whole rollback.
+  if [ -n "${candidate_volume:-}" ] && volume_exists "$candidate_volume"; then
+    remove_volume_exact "$candidate_volume" || rollback_error=1
+    [ "$rollback_error" -ne 0 ] || { volume_swapped=0; manifest_set volume_swapped 0 || rollback_error=1; }
+  fi
   health_deadline_ok || rollback_error=1
   [ -z "${active_override:-}" ] || rm -f "$active_override"
   rm -f "${candidate_env:-}" "${candidate_override:-}"
